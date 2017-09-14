@@ -195,6 +195,20 @@ def send_block(writers, block, nonce, block_hash):
     for writer in writers:
         write_block(msg, writer)
 
+def read_block(ext_conn):
+    # buffer to store the block being read
+    buf = bytearray(BLOCK_MSG_LEN)
+    bytes_to_read = BLOCK_MSG_LEN
+    while bytes_to_read > 0:
+        readable_conns, _, _ = select.select([ext_conn], [], [])
+        if len(readable_conns) == 1:
+            received = readable_conns[0].recv(bytes_to_read)
+            bytes_read = len(received)
+            buf_ind = BLOCK_MSG_LEN - bytes_to_read
+            buf[buf_ind:buf_ind+bytes_read] = received
+            bytes_to_read -= bytes_read
+    return buf
+
 def miner_node(num_workers, port, verbose=False):
     if verbose:
         print("Running", num_workers, "workers on ports", ports)
@@ -234,16 +248,6 @@ def miner_node(num_workers, port, verbose=False):
 
     global prev_hash, cur_block_height
 
-    # for longer messages, it may take multiple recv's to receive a full message,
-    # so to handle this we keep track of a state variable for each connection
-    # that alters the behavior
-    conn_state = {conn: CONN_STATE_READY for conn in read_conns + list(writers.values())}
-    # number of bytes left to read for a block on a given connection
-    bytes_remaining = {conn: 0 for conn in read_conns + list(writers.values())}
-    # the incomplete block being read on a given connection
-    conn_block = {}
-    # the incomplete block being written over a given connection
-
     # flag to indicate whether the miner thread is active
     currently_mining = False
 
@@ -257,65 +261,44 @@ def miner_node(num_workers, port, verbose=False):
                 # list of connections that can be read
                 incoming_conn, addr = conn.accept()
                 read_conns.append(incoming_conn)
-                conn_state[incoming_conn] = CONN_STATE_READY
-                bytes_remaining[incoming_conn] = 0
             else:
                 # this must be a new message from a previously connected node
-                if conn_state[conn] == CONN_STATE_READY:
-                    # first, read the opcode so we know how much data to chew
-                    msg_type = conn.recv(1)
-
-                    # separate handlers for each type of message
-                    if msg_type == OPCODE_TRANSACTION:
-                        handle_transaction(conn, conns_to_write)
-                        # if the mempool now contains at least 50000 transactions,
-                        # AND the miner thread is not busy, add them to a block and mine
-                        if len(mempool) >= NUM_TX_MEMPOOL and not currently_mining:
-                            # create a new block for mining
-                            print("Mining new block at height", cur_block_height)
-                            unmined_block = Block(NUM_TX_MEMPOOL, prev_hash, 
-                                                  NODE_ADDRESS, cur_block_height)
-                            for i in range(NUM_TX_MEMPOOL):
-                                transaction = mempool.pop(0)
-                                unmined_block.add_transaction(transaction)
-                            # begin the mining process in a separate thread
-                            miner_thread = Miner(unmined_block, interrupt_event, finish_event, nonce_q)
-                            miner_thread.start()
-                            currently_mining = True
-                    elif msg_type == OPCODE_BLOCK:
-                        # switch this connection to READ_BLOCK mode, in which it
-                        # repeatedly reads whenever able, until an entire block
-                        # has been read
-                        print("Switching this connection to READ_BLOCK mode!")
-                        conn_state[conn] = CONN_STATE_READ_BLOCK
-                        bytes_remaining[conn] = BLOCK_MSG_LEN
-                        conn_block[conn] = bytearray(BLOCK_MSG_LEN)
-                    elif msg_type == OPCODE_GETBLOCK:
-                        print("Received GET_BLOCK request on connection", conn)
-                        request_height = int(conn.recv(32))
-                    elif msg_type == OPCODE_GETHASH:
-                        print("Received GET_HASH request on connection", conn)
-                    elif msg_type == OPCODE_PORTS:
-                        print("Received updated ports list")
-                        known_ports = update_ports(conn)
-                        print("New ports are", known_ports)
-                        writers = update_writers(known_ports, writers, port)
-                elif conn_state[conn] == CONN_STATE_READ_BLOCK:
-                    # continue reading block data over this connection
-                    bytes_ind = BLOCK_MSG_LEN - bytes_remaining[conn]
-                    remote_bytes = conn.recv(bytes_remaining[conn])
-                    num_bytes_read = len(remote_bytes)
-                    print("Read", num_bytes_read, "bytes from the current block...")
-                    conn_block[conn][bytes_ind:bytes_ind+num_bytes_read] = remote_bytes
-                    bytes_remaining[conn] -= num_bytes_read
-                    # if we are done reading the block, verify the block and 
-                    # reset this connection to its normal state
-                    if bytes_remaining[conn] == 0:
-                        nonce, prior_hash, block_hash, block_height, block_miner_addr, block_data = parse_block(conn_block[conn])
-                        del conn_block[conn]
-                        conn_state[conn] = CONN_STATE_READY
-                        # signal the miner thread to stop, if it is still active
+                # first, read the opcode so we know how much data to chew
+                msg_type = conn.recv(1)
+                # separate handlers for each type of message
+                if msg_type == OPCODE_TRANSACTION:
+                    handle_transaction(conn, conns_to_write)
+                    # if the mempool now contains at least 50000 transactions,
+                    # AND the miner thread is not busy, add them to a block and mine
+                    if len(mempool) >= NUM_TX_MEMPOOL and not currently_mining:
+                        # create a new block for mining
+                        print("Mining new block at height", cur_block_height)
+                        unmined_block = Block(NUM_TX_MEMPOOL, prev_hash, 
+                                              NODE_ADDRESS, cur_block_height)
+                        for i in range(NUM_TX_MEMPOOL):
+                            transaction = mempool.pop(0)
+                            unmined_block.add_transaction(transaction)
+                        # begin the mining process in a separate thread
+                        miner_thread = Miner(unmined_block, interrupt_event, finish_event, nonce_q)
+                        miner_thread.start()
+                        currently_mining = True
+                elif msg_type == OPCODE_BLOCK:
+                    # read a block over the external connection
+                    remote_block = read_block(conn)
+                    nonce, prior_hash, block_hash, block_height, block_miner_addr, block_data = parse_block(remote_block)
+                    # if the miner is still running, signal it to stop
+                    if currently_mining:
                         interrupt_event.set()
+                elif msg_type == OPCODE_GETBLOCK:
+                    print("Received GET_BLOCK request on connection", conn)
+                    request_height = int(conn.recv(32))
+                elif msg_type == OPCODE_GETHASH:
+                    print("Received GET_HASH request on connection", conn)
+                elif msg_type == OPCODE_PORTS:
+                    print("Received updated ports list")
+                    known_ports = update_ports(conn)
+                    print("New ports are", known_ports)
+                    writers = update_writers(known_ports, writers, port)
 
         # check the progress of our mining
         if finish_event.is_set():
