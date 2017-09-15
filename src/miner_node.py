@@ -32,8 +32,6 @@ utxo = Counter()
 mempool = []
 # The block currently being mined, if any
 unmined_block = None
-# the hash of the last block we mined or received
-prev_hash = hashlib.sha256(b'0').digest()
 # the blockchain itself, implemented as a list of Blocks
 blockchain = []
 
@@ -109,6 +107,16 @@ def blockchain_height():
     -1 means an empty blockchain
     """
     return len(blockchain) - 1
+
+def latest_hash():
+    """
+    Get the hash of the block at the end of the current blockchain.
+    If the blockchain is empty, returns sha256('0') in accordance with spec
+    """
+    if len(blockchain) == 0:
+        return hashlib.sha256(b'0').digest()
+    else:
+        return blockchain[-1].block_hash
 
 def transaction_is_duplicate(transaction):
     """
@@ -309,7 +317,7 @@ def miner_node(num_workers, port, verbose=False):
     # used by the miner thread to pass back the nonce it found
     nonce_q = Queue()
 
-    global prev_hash, cur_block_height, unmined_block
+    global cur_block_height, unmined_block
 
     # flag to indicate whether the miner thread is active
     currently_mining = False
@@ -336,7 +344,7 @@ def miner_node(num_workers, port, verbose=False):
                     if len(mempool) >= NUM_TX_MEMPOOL and not currently_mining:
                         # create a new block for mining
                         print("Mining new block at height", blockchain_height() + 1)
-                        unmined_block = Block(prev_hash, NODE_ADDRESS, blockchain_height() + 1)
+                        unmined_block = Block(latest_hash(), NODE_ADDRESS, blockchain_height() + 1)
                         for i in range(NUM_TX_MEMPOOL):
                             transaction = mempool.pop(0)
                             unmined_block.add_transaction(transaction)
@@ -390,6 +398,5 @@ def miner_node(num_workers, port, verbose=False):
             # add the mined block to our blockchain
             blockchain.append(unmined_block)
             cur_block_height += 1
-            prev_hash = miner_results[1]
             currently_mining = False
             unmined_block = None
