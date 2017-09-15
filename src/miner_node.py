@@ -362,8 +362,15 @@ def miner_node(num_workers, port, verbose=False):
                 elif msg_type == OPCODE_GETBLOCK:
                     print("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
+                    if request_height <= blockchain_height():
+                        send_block([conn], blockchain[request_height],
+                                   blockchain[request_height].nonce,
+                                   blockchain[request_height].block_hash)
                 elif msg_type == OPCODE_GETHASH:
                     print("Received GET_HASH request on connection", conn)
+                    request_height = int(conn.recv(32))
+                    if request_height <= blockchain_height():
+                        conn.send(blockchain[request_height].block_hash)
                 elif msg_type == OPCODE_PORTS:
                     print("Received updated ports list")
                     known_ports = update_ports(conn)
