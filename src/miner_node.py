@@ -9,7 +9,6 @@ from queue import Queue
 
 from utils import *
 from block import Block
-from blockchain import Blockchain
 
 # Constants
 NODE_ADDRESS = hashlib.sha256(b"jpc362").digest()
@@ -31,10 +30,12 @@ cur_block_height = 0
 utxo = Counter()
 # The mempool stores all transactions that have not yet been committed
 mempool = []
+# The block currently being mined, if any
+unmined_block = None
 # the hash of the last block we mined or received
 prev_hash = hashlib.sha256(b'0').digest()
-# the blockchain itself
-bc = Blockchain()
+# the blockchain itself, implemented as a list of Blocks
+blockchain = []
 
 class Miner(threading.Thread):
     """
@@ -102,6 +103,21 @@ def parse_transaction(msg):
     timestamp = int(msg[96:])
     return sender, receiver, amt, timestamp
 
+def blockchain_height():
+    """
+    Returns the height of the currently accepted blockchain.
+    -1 means an empty blockchain
+    """
+    return len(blockchain) - 1
+
+def transaction_is_duplicate(transaction):
+    """
+    Check whether the given transaction already exists in the mempool
+    or in the unmined block
+    """
+    return (transaction in mempool) or \
+           (unmined_block is not None and unmined_block.contains_transaction(transaction))
+
 def handle_transaction(ext_conn, writers):
     """
     Handle a new transaction being sent over the external connection ext_conn.
@@ -109,7 +125,8 @@ def handle_transaction(ext_conn, writers):
     transaction = ext_conn.recv(128)
     print("Received transaction")
     # don't repeat process out this transaction if we have already seen it
-    if transaction in mempool:
+    if transaction_is_duplicate(transaction):
+        print("Transaction is duplicate, skipping...")
         return
     sender, receiver, amt, timestamp = parse_transaction(transaction)
     print("From:", binascii.hexlify(sender))
@@ -141,7 +158,13 @@ def parse_block(block_bytes):
     block_miner_addr = block_bytes[128:160]
     block_data = block_bytes[160:]
     print("Finished receiving block from node at address", block_miner_addr, "with height", block_height)
-    return nonce, prior_hash, block_hash, block_height, block_miner_addr, block_data
+    # construct a Block object using the received data
+    new_block = Block(prior_hash, block_miner_addr, block_height)
+    for block_data_ind in range(0, 128 * NUM_TX_MEMPOOL, 128):
+        new_block.add_transaction(bytes(block_data[block_data_ind:block_data_ind+128]))
+    new_block.set_nonce(nonce)
+    new_block.set_hash(block_hash)
+    return new_block
 
 def update_ports(ext_conn):
     """
@@ -209,6 +232,48 @@ def read_block(ext_conn):
             bytes_to_read -= bytes_read
     return buf
 
+def drop_unmined_block(remote_block):
+    """
+    This function is called when a block is received via SEND_BLOCK that is at
+    the same height as the block currently being mined. If this happens, we
+    must undo the changes made to the UTXO set by the unmined block, validate
+    the new block, and accept the new block. Any transactions that were in
+    the unmined block and not in the received block will be placed back onto
+    the start of the mempool for inclusion in a future block. Returns whether
+    or not we chose to accept the remote block.
+    """
+    global mempool
+
+    # this should never be called when there is no block being mined
+    assert(unmined_block is not None)
+    # validate the new block by checking its prior hash against the unmined
+    # block's. If they do not match, we have a fork with tied lengths, so to
+    # keep things simple we temporarily keep our own fork.
+    if remote_block.prev_hash != unmined_block.prev_hash:
+        return False
+    # first, undo the transactions in the unmined block
+    print("Undoing uncommitted UTXO changes...")
+    for transaction in unmined_block.transactions:
+        sender, receiver, amt, timestamp = parse_transaction(transaction)
+        utxo[sender] += amt
+        utxo[receiver] -= amt
+    # commit all transactions to the UTXO set
+    for transaction in remote_block.transactions:
+        sender, receiver, amt, timestamp = parse_transaction(transaction)
+        utxo[sender] -= amt
+        utxo[receiver] += amt
+    blockchain.append(remote_block)
+    # any transactions that were in the unmined block but not in the new
+    # block must be placed back at the head of the mempool
+    unhandled_tx = []
+    for transaction in unmined_block.transactions:
+        if not remote_block.contains_transaction(transaction):
+            unhandled_tx.append(transaction)
+        if len(unhandled_tx) > 0:
+            print("Placing", len(unhandled_tx), "unhandled transactions back into mempool")
+            mempool = unhandled_tx + mempool
+    return True
+
 def miner_node(num_workers, port, verbose=False):
     if verbose:
         print("Running", num_workers, "workers on ports", ports)
@@ -244,9 +309,7 @@ def miner_node(num_workers, port, verbose=False):
     # used by the miner thread to pass back the nonce it found
     nonce_q = Queue()
 
-    unmined_block = None
-
-    global prev_hash, cur_block_height
+    global prev_hash, cur_block_height, unmined_block
 
     # flag to indicate whether the miner thread is active
     currently_mining = False
@@ -272,9 +335,8 @@ def miner_node(num_workers, port, verbose=False):
                     # AND the miner thread is not busy, add them to a block and mine
                     if len(mempool) >= NUM_TX_MEMPOOL and not currently_mining:
                         # create a new block for mining
-                        print("Mining new block at height", cur_block_height)
-                        unmined_block = Block(NUM_TX_MEMPOOL, prev_hash, 
-                                              NODE_ADDRESS, cur_block_height)
+                        print("Mining new block at height", blockchain_height() + 1)
+                        unmined_block = Block(prev_hash, NODE_ADDRESS, blockchain_height() + 1)
                         for i in range(NUM_TX_MEMPOOL):
                             transaction = mempool.pop(0)
                             unmined_block.add_transaction(transaction)
@@ -284,11 +346,19 @@ def miner_node(num_workers, port, verbose=False):
                         currently_mining = True
                 elif msg_type == OPCODE_BLOCK:
                     # read a block over the external connection
-                    remote_block = read_block(conn)
-                    nonce, prior_hash, block_hash, block_height, block_miner_addr, block_data = parse_block(remote_block)
-                    # if the miner is still running, signal it to stop
-                    if currently_mining:
+                    remote_block_data = read_block(conn)
+                    remote_block = parse_block(remote_block_data)
+                    # if the miner is still mining a block of the same height as the one
+                    # we just received, we need to kill it and accept the received block
+                    if currently_mining and remote_block.height == blockchain_height() + 1:
                         interrupt_event.set()
+                        remote_block_accepted = drop_unmined_block(remote_block)
+                        if not remote_block_accepted:
+                            miner_thread = Miner(unmined_block, interrupt_event, finish_event, nonce_q)
+                            miner_thread.start()
+                            currently_mining = True
+                        else:
+                            currently_mining = False
                 elif msg_type == OPCODE_GETBLOCK:
                     print("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
@@ -306,10 +376,13 @@ def miner_node(num_workers, port, verbose=False):
             miner_results = nonce_q.get()
             print("Found working nonce", miner_results[0], "with hash", miner_results[1])
             finish_event.clear()
+            unmined_block.set_nonce(miner_results[0])
+            unmined_block.set_hash(miner_results[1])
             # broadcast the block to all other nodes
             send_block(conns_to_write, unmined_block, miner_results[0], miner_results[1])
             # add the mined block to our blockchain
-            bc.add_block(unmined_block, cur_block_height, miner_results[1])
+            blockchain.append(unmined_block)
             cur_block_height += 1
             prev_hash = miner_results[1]
             currently_mining = False
+            unmined_block = None

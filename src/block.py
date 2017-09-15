@@ -5,8 +5,7 @@ class Block:
     Represents a block of MVBCoin transactions.
     """
 
-    def __init__(self, max_transactions, prev_hash, node_address, height):
-        self.max_transactions = max_transactions
+    def __init__(self, prev_hash, node_address, height):
         self.prev_hash = prev_hash
         self.node_address = node_address
         self.height = height
@@ -21,13 +20,11 @@ class Block:
     def contains_transaction(self, transaction):
         return transaction in self.transactions
 
-    def add_all_transactions(self, blockdata):
-        """
-        Manually set the bytestring containing all transactions, bypassing the
-        transaction set. Used the optimize the process of receiving a remote
-        block, so that we don't have to parse out the transactions
-        """
-        self.byte_repr = self.prev_hash + int_to_bytes(self.height, 32) + self.node_address + blockdata
+    def set_nonce(self, nonce):
+        self.nonce = nonce
+
+    def set_hash(self, block_hash):
+        self.block_hash = block_hash
 
     def as_bytearray(self):
         # block data consists of all the transactions in this block, in
