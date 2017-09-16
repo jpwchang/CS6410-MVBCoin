@@ -159,12 +159,16 @@ def parse_block(block_bytes, num_tx):
     """
     Parse a block sent over a socket as raw bytes
     """
-    nonce = block_bytes[0:32]
-    prior_hash = block_bytes[32:64]
-    block_hash = block_bytes[64:96]
-    block_height = int(block_bytes[96:128])
-    block_miner_addr = block_bytes[128:160]
-    block_data = block_bytes[160:]
+    try:
+        nonce = block_bytes[0:32]
+        prior_hash = block_bytes[32:64]
+        block_hash = block_bytes[64:96]
+        block_height = int(block_bytes[96:128])
+        block_miner_addr = block_bytes[128:160]
+        block_data = block_bytes[160:]
+    except:
+        print("Invalid block encountered; aborting!")
+        return None
     print("Finished receiving block from node at address", block_miner_addr, "with height", block_height)
     # construct a Block object using the received data
     new_block = Block(prior_hash, block_miner_addr, block_height)
@@ -360,6 +364,9 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
                     # read a block over the external connection
                     remote_block_data = read_block(conn, block_msg_len)
                     remote_block = parse_block(remote_block_data, num_tx_in_block)
+                    # ignore malformed blocks
+                    if remote_block is None:
+                        continue
                     # if the miner is still mining a block of the same height as the one
                     # we just received, we need to kill it and accept the received block
                     if currently_mining and remote_block.height == blockchain_height() + 1:
