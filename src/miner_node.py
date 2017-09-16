@@ -18,8 +18,6 @@ OPCODE_BLOCK = b'1'
 OPCODE_GETBLOCK = b'2'
 OPCODE_GETHASH = b'3'
 OPCODE_PORTS = b'4'
-NUM_TX_MEMPOOL = 50000
-BLOCK_MSG_LEN = 160 + 128 * NUM_TX_MEMPOOL
 # connections states
 CONN_STATE_READY = 0
 CONN_STATE_READ_BLOCK = 1
@@ -40,10 +38,11 @@ class Miner(threading.Thread):
     Thread that performs block mining in the background, allowing the
     main thread to continue listening for messages
     """
-    def __init__(self, block, interrupt_event, finish_event, result_q, 
+    def __init__(self, block, difficulty, interrupt_event, finish_event, result_q, 
                  group=None, target=None, name=None, args=(), kwargs={}, daemon=None):
         super().__init__(group=group, target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
         self.block = block
+        self.difficulty = difficulty
         self.interrupt_event = interrupt_event
         self.finish_event = finish_event
         self.result_q = result_q
@@ -51,15 +50,16 @@ class Miner(threading.Thread):
     def run(self):
         print("Miner thread started!")
         nonce_seed = 0
-        block_hash = hashlib.sha256(self.block.as_bytearray())
+        bytes_to_hash = bytearray(128 + 128 * self.block.num_transactions)
+        # leave the first 32 bits of bytes_to_hash for the nonce
+        bytes_to_hash[32:] = self.block.as_bytearray()
         while not self.interrupt_event.is_set():
             # keep looping until we find a nonce that works, OR we get
             # interrupted by an incoming block
             nonce = int_to_bytes(nonce_seed, 32)
-            nonced_hash = block_hash.copy()
-            nonced_hash.update(nonce)
-            h = nonced_hash.digest()
-            if h[0] == 48 and h[1] == 48 and h[2] == 48:
+            bytes_to_hash[:32] = nonce
+            h = hashlib.sha256(bytes_to_hash).digest()
+            if h[:self.difficulty] == b'0' * self.difficulty:
                 # we found a working nonce!
                 print("[MINER] Nonce found!")
                 self.result_q.put((nonce, h))
@@ -155,7 +155,7 @@ def handle_transaction(ext_conn, writers):
     else:
         print("Transaction invalid; sender has %d MVBCoin but tried to send %d. Skipping..." % (utxo[sender], amt))
 
-def parse_block(block_bytes):
+def parse_block(block_bytes, num_tx):
     """
     Parse a block sent over a socket as raw bytes
     """
@@ -168,7 +168,7 @@ def parse_block(block_bytes):
     print("Finished receiving block from node at address", block_miner_addr, "with height", block_height)
     # construct a Block object using the received data
     new_block = Block(prior_hash, block_miner_addr, block_height)
-    for block_data_ind in range(0, 128 * NUM_TX_MEMPOOL, 128):
+    for block_data_ind in range(0, 128 * num_tx, 128):
         new_block.add_transaction(bytes(block_data[block_data_ind:block_data_ind+128]))
     new_block.set_nonce(nonce)
     new_block.set_hash(block_hash)
@@ -210,7 +210,7 @@ def send_block(writers, block, nonce, block_hash):
     # get the byte representation of the block
     block_bytes = block.as_bytearray()
     # create a buffer to store our message
-    msg = bytearray(161 + 128 * NUM_TX_MEMPOOL)
+    msg = bytearray(161 + 128 * block.num_transactions)
     # the first byte is the opcode, which is 1 (ASCII = 49)
     msg[0] = 49
     # the next 32 bytes are the nonce, which we mined
@@ -226,16 +226,16 @@ def send_block(writers, block, nonce, block_hash):
     for writer in writers:
         write_block(msg, writer)
 
-def read_block(ext_conn):
+def read_block(ext_conn, block_msg_len):
     # buffer to store the block being read
-    buf = bytearray(BLOCK_MSG_LEN)
-    bytes_to_read = BLOCK_MSG_LEN
+    buf = bytearray(block_msg_len)
+    bytes_to_read = block_msg_len
     while bytes_to_read > 0:
         readable_conns, _, _ = select.select([ext_conn], [], [])
         if len(readable_conns) == 1:
             received = readable_conns[0].recv(bytes_to_read)
             bytes_read = len(received)
-            buf_ind = BLOCK_MSG_LEN - bytes_to_read
+            buf_ind = block_msg_len - bytes_to_read
             buf[buf_ind:buf_ind+bytes_read] = received
             bytes_to_read -= bytes_read
     return buf
@@ -282,7 +282,7 @@ def drop_unmined_block(remote_block):
             mempool = unhandled_tx + mempool
     return True
 
-def miner_node(num_workers, port, verbose=False):
+def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
     if verbose:
         print("Running", num_workers, "workers on ports", ports)
 
@@ -317,7 +317,11 @@ def miner_node(num_workers, port, verbose=False):
     # used by the miner thread to pass back the nonce it found
     nonce_q = Queue()
 
-    global cur_block_height, unmined_block
+    global cur_block_height, unmined_block 
+
+    # set the length of a block message based on the number of transactions
+    # allowed in a block
+    block_msg_len = 160 + 128 * num_tx_in_block
 
     # flag to indicate whether the miner thread is active
     currently_mining = False
@@ -341,28 +345,28 @@ def miner_node(num_workers, port, verbose=False):
                     handle_transaction(conn, conns_to_write)
                     # if the mempool now contains at least 50000 transactions,
                     # AND the miner thread is not busy, add them to a block and mine
-                    if len(mempool) >= NUM_TX_MEMPOOL and not currently_mining:
+                    if len(mempool) >= num_tx_in_block and not currently_mining:
                         # create a new block for mining
                         print("Mining new block at height", blockchain_height() + 1)
                         unmined_block = Block(latest_hash(), NODE_ADDRESS, blockchain_height() + 1)
-                        for i in range(NUM_TX_MEMPOOL):
+                        for i in range(num_tx_in_block):
                             transaction = mempool.pop(0)
                             unmined_block.add_transaction(transaction)
                         # begin the mining process in a separate thread
-                        miner_thread = Miner(unmined_block, interrupt_event, finish_event, nonce_q)
+                        miner_thread = Miner(unmined_block, difficulty, interrupt_event, finish_event, nonce_q)
                         miner_thread.start()
                         currently_mining = True
                 elif msg_type == OPCODE_BLOCK:
                     # read a block over the external connection
-                    remote_block_data = read_block(conn)
-                    remote_block = parse_block(remote_block_data)
+                    remote_block_data = read_block(conn, block_msg_len)
+                    remote_block = parse_block(remote_block_data, num_tx_in_block)
                     # if the miner is still mining a block of the same height as the one
                     # we just received, we need to kill it and accept the received block
                     if currently_mining and remote_block.height == blockchain_height() + 1:
                         interrupt_event.set()
                         remote_block_accepted = drop_unmined_block(remote_block)
                         if not remote_block_accepted:
-                            miner_thread = Miner(unmined_block, interrupt_event, finish_event, nonce_q)
+                            miner_thread = Miner(unmined_block, difficulty, interrupt_event, finish_event, nonce_q)
                             miner_thread.start()
                             currently_mining = True
                         else:

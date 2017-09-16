@@ -26,6 +26,10 @@ class Block:
     def set_hash(self, block_hash):
         self.block_hash = block_hash
 
+    @property
+    def num_transactions(self):
+        return len(self.transactions)
+
     def as_bytearray(self):
         # block data consists of all the transactions in this block, in
         # descending order of amount
