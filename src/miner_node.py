@@ -447,22 +447,32 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
                     # This algorithm was based on discussion with Matt Burke.
                     if remote_block.height > blockchain_height():
                         # first, stop any mining currently in progress
+                        unhandled_tx = []
                         if currently_mining:
                             interrupt_event.set()
                             print("Undoing uncommitted UTXO changes...")
-                            unhandled_tx = []
                             for transaction in unmined_block.transactions:
                                 sender, receiver, amt, timestamp = parse_transaction(transaction)
                                 utxo[sender] += amt
                                 utxo[receiver] -= amt    
                                 unhandled_tx.append(transaction)
-                            if len(unhandled_tx) > 0:
-                                print("Placing", len(unhandled_tx), "unhandled transactions back into mempool")
-                                mempool = unhandled_tx + mempool
-                            currently_mining = False
-                            unmined_block = None
+                                # temporarily remove this transaction from history
+                                tx_history.discard(transaction)
                         # run the recursive synchronization algorithm
                         synchronize_blockchain(list(writers.values()), remote_block, block_msg_len, num_tx_in_block)
+                        # flush any unhandled transactions back into the mempool
+                        if currently_mining:
+                            true_unhandled_tx = []
+                            # do not place transactions that were already handled
+                            # in the merged chain back into the mempool
+                            for transaction in unhandled_tx:
+                                if transaction not in tx_history:
+                                    true_unhandled_tx.append(transaction)
+                            if len(true_unhandled_tx) > 0:
+                                print("Placing", len(true_unhandled_tx), "unhandled transactions back into mempool")
+                                mempool = true_unhandled_tx + mempool
+                            currently_mining = False
+                            unmined_block = None
                 elif msg_type == OPCODE_GETBLOCK:
                     print("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
