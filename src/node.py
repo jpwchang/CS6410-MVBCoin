@@ -13,11 +13,11 @@ from miner_node import miner_node
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-bootstrap", action="store_true")
-    parser.add_argument("-numworkers", action="store", type=int, default=1)
-    parser.add_argument("-ports", action="store", nargs="+", type=int, default=[10000])
-    parser.add_argument("-numtxinblock", action="store", type=int, default=50000)
-    parser.add_argument("-difficulty", action="store", type=int, default=1)
+    parser.add_argument("-bootstrap", "--bootstrap", action="store_true")
+    parser.add_argument("-numworkers", "--numworkers", action="store", type=int, default=1)
+    parser.add_argument("-ports", "--ports", action="store", nargs="+", type=int, default=[10000])
+    parser.add_argument("-numtxinblock", "--numtxinblock", action="store", type=int, default=50000)
+    parser.add_argument("-difficulty", "--difficulty", action="store", type=int, default=1)
     args = parser.parse_args()
 
     # For milestone 1: force single thread!
