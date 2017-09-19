@@ -68,22 +68,6 @@ class Miner(threading.Thread):
         print("[MINER] Interrupted by incoming block!")
         self.interrupt_event.clear()
 
-def get_known_ports(my_port):
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        # send port number concatenated with this node's address
-        msg = int_to_bytes(my_port) + NODE_ADDRESS
-        
-        sock.bind(("localhost", my_port))
-        sock.connect(("localhost", BOOTSTRAP_PORT))
-        sock.sendall(msg)
-        # now wait for the reply from the bootnode
-        # since we don't know how many ports there will be the length of the
-        # reply will be unknown
-        reply = sock.recv(2048)
-        print("Received reply", reply)
-    # ignore the first 7 bytes (opcode and num_ports) and parse the ports
-    return parse_ports(reply[7:])
-
 def parse_ports(msg):
     # extract the list of ports from the reply
     ports = []
@@ -91,6 +75,22 @@ def parse_ports(msg):
         ports.append(int(msg[i:i+6]))
     print(ports)
     return ports
+
+def update_ports(ext_conn):
+    """
+    Handle a port list update being sent over the external connection ext_conn
+    """
+    num_conns = int(ext_conn.recv(6))
+    return parse_ports(ext_conn.recv(num_conns * 6))
+
+def get_known_ports(sock, my_port):
+    # send port number concatenated with this node's address
+    msg = int_to_bytes(my_port) + NODE_ADDRESS
+    sock.sendall(msg)
+    # consume the opcode from the bootnode's reply
+    sock.recv(1)
+    print("Bootstrap node returned the following ports:")
+    return update_ports(sock)
 
 def parse_transaction(msg):
     sender = msg[:32]
@@ -171,13 +171,6 @@ def parse_block(block_bytes, num_tx):
     new_block.set_nonce(nonce)
     new_block.set_hash(block_hash)
     return new_block
-
-def update_ports(ext_conn):
-    """
-    Handle a port list update being sent over the external connection ext_conn
-    """
-    num_conns = int(ext_conn.recv(6))
-    return parse_ports(ext_conn.recv(num_conns * 6))
 
 def update_writers(port_list, writers, own_port):
     """
@@ -371,21 +364,23 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
     # connections to other nodes, indexed by their ports
     writers = {}
 
-    # send a message to the bootnode informing that we are ready,
-    # and get back the list of known ports
-    known_ports = get_known_ports(port)
-    # create new connections for the known ports
-    writers = update_writers(known_ports, writers, port)
-
     # create a socket on which to listen to other nodes
     node_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     node_sock.bind(("localhost", port))
     node_sock.listen(10)
 
+    # send a message to the bootnode informing that we are ready,
+    # and get back the list of known ports
+    boot_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    boot_sock.connect(("localhost", BOOTSTRAP_PORT))
+    known_ports = get_known_ports(boot_sock, port)
+    # create new connections for the known ports
+    writers = update_writers(known_ports, writers, port)
+
     # list of connections that could receive new messages. This includes
     # our own socket (which could receive an incoming connection) and
     # any currently active external connections
-    read_conns = [node_sock]
+    read_conns = [node_sock, boot_sock]
 
     # synchronization primitives for communicating with miner thread
     # used to stop the mining when a new block is received
