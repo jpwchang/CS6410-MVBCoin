@@ -361,6 +361,8 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
     for i in range(100):
         utxo[hashlib.sha256(bytes(str(i), encoding='ascii')).digest()] = 100000
 
+    # list of known ports we can write to (initially empty)
+    known_ports = []
     # connections to other nodes, indexed by their ports
     writers = {}
 
@@ -373,14 +375,14 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
     # and get back the list of known ports
     boot_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     boot_sock.connect(("localhost", BOOTSTRAP_PORT))
-    known_ports = get_known_ports(boot_sock, port)
-    # create new connections for the known ports
-    writers = update_writers(known_ports, writers, port)
+    # send port number concatenated with this node's address
+    msg = int_to_bytes(port) + NODE_ADDRESS
+    boot_sock.sendall(msg)
 
     # list of connections that could receive new messages. This includes
     # our own socket (which could receive an incoming connection) and
     # any currently active external connections
-    read_conns = [node_sock, boot_sock]
+    read_conns = [node_sock]
 
     # synchronization primitives for communicating with miner thread
     # used to stop the mining when a new block is received
