@@ -18,6 +18,7 @@ def main():
     parser.add_argument("-ports", "--ports", action="store", nargs="+", type=int, default=[10000])
     parser.add_argument("-numtxinblock", "--numtxinblock", action="store", type=int, default=50000)
     parser.add_argument("-difficulty", "--difficulty", action="store", type=int, default=1)
+    parser.add_argument("-verbose", "--verbose", action="store_true")
     args = parser.parse_args()
 
     # For milestone 1: force single thread!
@@ -28,7 +29,7 @@ def main():
     if args.bootstrap:
         bootstrap_node()
     else:
-        miner_node(num_workers, ports[0], args.numtxinblock, args.difficulty)
+        miner_node(num_workers, ports[0], args.numtxinblock, args.difficulty, args.verbose)
 
 if __name__ == '__main__':
     main()

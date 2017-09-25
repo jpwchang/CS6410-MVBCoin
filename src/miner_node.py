@@ -30,6 +30,13 @@ blockchain = []
 # the set of all transactions we have ever received (either directly or as part
 # of an accepted block from another node)
 tx_history = set()
+# controls verbosity setting for all functions in this file
+verbose = False
+
+# drop-in replacement for print which only prints when the verbose flag is set
+def print_if_verbose(*args):
+    if verbose:
+        print(*args)
 
 class Miner(threading.Thread):
     """
@@ -46,7 +53,7 @@ class Miner(threading.Thread):
         self.result_q = result_q
 
     def run(self):
-        print("Miner thread started!")
+        print_if_verbose("Miner thread started!")
         nonce_seed = 0
         bytes_to_hash = bytearray(128 + 128 * self.block.num_transactions)
         # leave the first 32 bits of bytes_to_hash for the nonce
@@ -59,13 +66,13 @@ class Miner(threading.Thread):
             h = hashlib.sha256(bytes_to_hash).digest()
             if h[:self.difficulty] == b'0' * self.difficulty:
                 # we found a working nonce!
-                print("[MINER] Nonce found!")
+                print_if_verbose("[MINER] Nonce found!")
                 self.result_q.put((nonce, h))
                 self.finish_event.set()
                 # the miner thread is done
                 return
             nonce_seed += 1
-        print("[MINER] Interrupted by incoming block!")
+        print_if_verbose("[MINER] Interrupted by incoming block!")
         self.interrupt_event.clear()
 
 def parse_ports(msg):
@@ -73,7 +80,7 @@ def parse_ports(msg):
     ports = []
     for i in range(0, len(msg), 6):
         ports.append(int(msg[i:i+6]))
-    print(ports)
+    print_if_verbose(ports)
     return ports
 
 def update_ports(ext_conn):
@@ -82,15 +89,6 @@ def update_ports(ext_conn):
     """
     num_conns = int(ext_conn.recv(6))
     return parse_ports(ext_conn.recv(num_conns * 6))
-
-def get_known_ports(sock, my_port):
-    # send port number concatenated with this node's address
-    msg = int_to_bytes(my_port) + NODE_ADDRESS
-    sock.sendall(msg)
-    # consume the opcode from the bootnode's reply
-    sock.recv(1)
-    print("Bootstrap node returned the following ports:")
-    return update_ports(sock)
 
 def parse_transaction(msg):
     sender = msg[:32]
@@ -121,20 +119,20 @@ def handle_transaction(ext_conn, writers):
     Handle a new transaction being sent over the external connection ext_conn.
     """
     transaction = ext_conn.recv(128)
-    print("Received transaction")
+    print_if_verbose("Received transaction")
     # don't repeat process out this transaction if we have already seen it
     if transaction in tx_history or transaction in mempool:
-        print("Transaction is duplicate, skipping...")
+        print_if_verbose("Transaction is duplicate, skipping...")
         return
     sender, receiver, amt, timestamp = parse_transaction(transaction)
-    print("From:", binascii.hexlify(sender))
-    print("To:", binascii.hexlify(receiver))
-    print("Amount:", amt)
-    print("Timestamp:", timestamp)
+    print_if_verbose("From:", binascii.hexlify(sender))
+    print_if_verbose("To:", binascii.hexlify(receiver))
+    print_if_verbose("Amount:", amt)
+    print_if_verbose("Timestamp:", timestamp)
     # check if the transaction is valid (sender must have enough coins
     # according to the UTXO set)
     if amt <= utxo[sender]:
-        print("Sender has enough MVBCoin, transaction is valid")
+        print_if_verbose("Sender has enough MVBCoin, transaction is valid")
         # propagate the transaction
         for writer in writers:
             writer.sendall(b'0' + transaction)
@@ -146,7 +144,7 @@ def handle_transaction(ext_conn, writers):
         utxo[sender] -= amt
         utxo[receiver] += amt
     else:
-        print("Transaction invalid; sender has %d MVBCoin but tried to send %d. Skipping..." % (utxo[sender], amt))
+        print_if_verbose("Transaction invalid; sender has %d MVBCoin but tried to send %d. Skipping..." % (utxo[sender], amt))
 
 def parse_block(block_bytes, num_tx):
     """
@@ -160,10 +158,10 @@ def parse_block(block_bytes, num_tx):
         block_miner_addr = block_bytes[128:160]
         block_data = block_bytes[160:]
     except BaseException as e:
-        print("Invalid block encountered; aborting! (Error:", e, ")")
-        print(block_bytes)
+        print_if_verbose("Invalid block encountered; aborting! (Error:", e, ")")
+        print_if_verbose(block_bytes)
         return None
-    print("Finished receiving block from node at address", block_miner_addr, "with height", block_height)
+    print_if_verbose("Finished receiving block from node at address", block_miner_addr, "with height", block_height)
     # construct a Block object using the received data
     new_block = Block(prior_hash, block_miner_addr, block_height)
     for block_data_ind in range(0, 128 * num_tx, 128):
@@ -217,7 +215,7 @@ def send_block(writers, block, nonce, block_hash, include_opcode=True):
     # off the first byte
     if not include_opcode:
         msg = msg[1:]
-    print("Sending message with length", len(msg))
+    print_if_verbose("Sending message with length", len(msg))
     for writer in writers:
         write_block(msg, writer)
 
@@ -255,7 +253,7 @@ def drop_unmined_block(remote_block):
     if remote_block.prev_hash != unmined_block.prev_hash:
         return False
     # first, undo the transactions in the unmined block
-    print("Undoing uncommitted UTXO changes...")
+    print_if_verbose("Undoing uncommitted UTXO changes...")
     for transaction in unmined_block.transactions:
         sender, receiver, amt, timestamp = parse_transaction(transaction)
         utxo[sender] += amt
@@ -274,7 +272,7 @@ def drop_unmined_block(remote_block):
         if not remote_block.contains_transaction(transaction):
             unhandled_tx.append(transaction)
     if len(unhandled_tx) > 0:
-        print("Placing", len(unhandled_tx), "unhandled transactions back into mempool")
+        print_if_verbose("Placing", len(unhandled_tx), "unhandled transactions back into mempool")
         mempool = unhandled_tx + mempool
     return True
 
@@ -317,7 +315,7 @@ def sync_blockchain_helper(writers, height, desired_hash, block_msg_len, num_tx_
             # adding the block to the blockchain may overwrite an existing block,
             # in which case we need to undo its transactions
             if blockchain[height] is not None:
-                print("Undoing transactions in discarded block at height", height)
+                print_if_verbose("Undoing transactions in discarded block at height", height)
                 for transaction in blockchain[height].transactions:
                     sender, receiver, amt, timestamp = parse_transaction(transaction)
                     utxo[sender] += amt
@@ -340,7 +338,7 @@ def synchronize_blockchain(writers, ending_block, block_msg_len, num_tx_in_block
     ending_block.
     Algorithm based on Piazza comment by Jake Gardner
     """
-    print("Synchronizing blockchain with global state...")
+    print_if_verbose("Synchronizing blockchain with global state...")
     # extend the list representing our blockchain so that it's height matches
     # that of the global one. Any slots between our current height and that of
     # ending_block will be temporarily filled with Nones
@@ -351,11 +349,12 @@ def synchronize_blockchain(writers, ending_block, block_msg_len, num_tx_in_block
     # recursively fill in the gaps left when the blockchain was extended
     sync_blockchain_helper(writers, ending_block.height - 1, ending_block.prev_hash, 
                            block_msg_len, num_tx_in_block)
-    print("Synchronization complete! Blockchain now has height", blockchain_height())
+    print_if_verbose("Synchronization complete! Blockchain now has height", blockchain_height())
 
-def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
-    if verbose:
-        print("Running", num_workers, "workers on ports", ports)
+def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=False):
+    # set the verbosity flag based on input parameter
+    global verbose 
+    verbose = verbose_setting
 
     # initialize the UTXO set
     for i in range(100):
@@ -420,7 +419,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
                     handle_transaction(conn, conns_to_write)
                 elif msg_type == OPCODE_BLOCK:
                     # read a block over the external connection
-                    print("Received block on connection", conn)
+                    print_if_verbose("Received block on connection", conn)
                     remote_block_data = read_block(conn, block_msg_len)
                     remote_block = parse_block(remote_block_data, num_tx_in_block)
                     # ignore malformed blocks
@@ -452,7 +451,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
                         unhandled_tx = []
                         if currently_mining:
                             interrupt_event.set()
-                            print("Undoing uncommitted UTXO changes...")
+                            print_if_verbose("Undoing uncommitted UTXO changes...")
                             for transaction in unmined_block.transactions:
                                 sender, receiver, amt, timestamp = parse_transaction(transaction)
                                 utxo[sender] += amt
@@ -471,12 +470,12 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
                                 if transaction not in tx_history:
                                     true_unhandled_tx.append(transaction)
                             if len(true_unhandled_tx) > 0:
-                                print("Placing", len(true_unhandled_tx), "unhandled transactions back into mempool")
+                                print_if_verbose("Placing", len(true_unhandled_tx), "unhandled transactions back into mempool")
                                 mempool = true_unhandled_tx + mempool
                             currently_mining = False
                             unmined_block = None
                 elif msg_type == OPCODE_GETBLOCK:
-                    print("Received GET_BLOCK request on connection", conn)
+                    print_if_verbose("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
                     # only reply if our blockchain is long enough
                     if request_height <= blockchain_height():
@@ -485,21 +484,21 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
                                    blockchain[request_height].block_hash,
                                    include_opcode=False)
                 elif msg_type == OPCODE_GETHASH:
-                    print("Received GET_HASH request on connection", conn)
+                    print_if_verbose("Received GET_HASH request on connection", conn)
                     request_height = int(conn.recv(32))
                     # only reply if our blockchain is long enough
                     if request_height <= blockchain_height():
                         conn.send(blockchain[request_height].block_hash)
                 elif msg_type == OPCODE_PORTS:
-                    print("Received updated ports list")
+                    print_if_verbose("Received updated ports list")
                     known_ports = update_ports(conn)
-                    print("New ports are", known_ports)
+                    print_if_verbose("New ports are", known_ports)
                     writers = update_writers(known_ports, writers, port)
             # if the mempool now contains at least 50000 transactions,
             # AND the miner thread is not busy, add them to a block and mine
             if len(mempool) >= num_tx_in_block and not currently_mining:
                 # create a new block for mining
-                print("Mining new block at height", blockchain_height() + 1)
+                print_if_verbose("Mining new block at height", blockchain_height() + 1)
                 unmined_block = Block(latest_hash(), NODE_ADDRESS, blockchain_height() + 1)
                 for i in range(num_tx_in_block):
                     transaction = mempool.pop(0)
@@ -512,7 +511,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose=False):
         if finish_event.is_set():
             # mining finished!
             miner_results = nonce_q.get()
-            print("Found working nonce", miner_results[0], "with hash", miner_results[1])
+            print_if_verbose("Found working nonce", miner_results[0], "with hash", miner_results[1])
             finish_event.clear()
             unmined_block.set_nonce(miner_results[0])
             unmined_block.set_hash(miner_results[1])
