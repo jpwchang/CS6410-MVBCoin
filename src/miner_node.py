@@ -4,6 +4,7 @@ import binascii
 import select
 import threading
 import random
+import time
 from collections import Counter
 from queue import Queue
 
@@ -400,6 +401,8 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
     # flag to indicate whether the miner thread is active
     currently_mining = False
 
+    start_time = None
+
     # listen for messages from other nodes
     while True:
         conns_to_read, conns_to_write, _ = select.select(read_conns, list(writers.values()), [])
@@ -416,6 +419,8 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                 msg_type = conn.recv(1)
                 # separate handlers for each type of message
                 if msg_type == OPCODE_TRANSACTION:
+                    if start_time is None:
+                        start_time = time.time()
                     handle_transaction(conn, conns_to_write)
                 elif msg_type == OPCODE_BLOCK:
                     # read a block over the external connection
@@ -474,6 +479,10 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                                 mempool = true_unhandled_tx + mempool
                             currently_mining = False
                             unmined_block = None
+                        if blockchain_height() == 20:
+                            end_time = time.time()
+                            print("Time elapsed: %.6f s" % (start_time - end_time))
+                            return
                 elif msg_type == OPCODE_GETBLOCK:
                     print_if_verbose("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
