@@ -526,7 +526,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
             blockchain.append(unmined_block)
             currently_mining = False
             unmined_block = None
-        if blockchain_height() == 20:
+        if blockchain_height() == 9:
             end_time = time.time()
-            print("Time elapsed: %.6f s" % (start_time - end_time))
+            print("Time elapsed: %.6f s" % (end_time - start_time))
             return
