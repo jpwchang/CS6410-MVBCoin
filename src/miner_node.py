@@ -479,10 +479,6 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                                 mempool = true_unhandled_tx + mempool
                             currently_mining = False
                             unmined_block = None
-                        if blockchain_height() == 20:
-                            end_time = time.time()
-                            print("Time elapsed: %.6f s" % (start_time - end_time))
-                            return
                 elif msg_type == OPCODE_GETBLOCK:
                     print_if_verbose("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
@@ -530,3 +526,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
             blockchain.append(unmined_block)
             currently_mining = False
             unmined_block = None
+        if blockchain_height() == 20:
+            end_time = time.time()
+            print("Time elapsed: %.6f s" % (start_time - end_time))
+            return
