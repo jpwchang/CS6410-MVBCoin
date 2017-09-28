@@ -160,7 +160,6 @@ def parse_block(block_bytes, num_tx):
         block_data = block_bytes[160:]
     except BaseException as e:
         print_if_verbose("Invalid block encountered; aborting! (Error:", e, ")")
-        print_if_verbose(block_bytes)
         return None
     print_if_verbose("Finished receiving block from node at address", block_miner_addr, "with height", block_height)
     # construct a Block object using the received data
