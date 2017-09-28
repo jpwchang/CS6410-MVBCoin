@@ -7,6 +7,7 @@ import random
 import time
 from collections import Counter
 from queue import Queue
+from cProfile import Profile
 
 from utils import *
 from block import Block
@@ -56,7 +57,7 @@ class Miner(threading.Thread):
         self.result_q = result_q
 
     def run(self):
-        start_time = time.time()
+        #start_time = time.time()
         print_if_verbose("Miner thread started!")
         nonce_seed = 0
         bytes_to_hash = bytearray(128 + 128 * self.block.num_transactions)
@@ -74,7 +75,7 @@ class Miner(threading.Thread):
                 self.result_q.put((nonce, h))
                 self.finish_event.set()
                 # the miner thread is done
-                print("[MINER] Time elapsed:", time.time() - start_time, "s")
+                #print("[MINER] Time elapsed:", time.time() - start_time, "s")
                 return
             nonce_seed += 1
         print_if_verbose("[MINER] Interrupted by incoming block!")
@@ -439,6 +440,8 @@ def handle_new_block(remote_block, num_tx_in_block, block_msg_len, interrupt_eve
                     writer.sendall(b'0' + transaction)
 
 def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=False):
+    pr = Profile()
+    pr.enable()
     # set the verbosity flag based on input parameter
     global verbose 
     verbose = verbose_setting
@@ -507,8 +510,8 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                     #    start_time = time.time()
                     handle_transaction(conn, conns_to_write)
                 elif msg_type == OPCODE_BLOCK:
-                    if blocks_received == 0:
-                        start_time = time.time()
+                    #if blocks_received == 0:
+                    #    start_time = time.time()
                     # read a block over the external connection
                     print_if_verbose("Received block on connection", conn)
                     remote_block_data = read_block(conn, block_msg_len)
@@ -565,10 +568,12 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
             blockchain.append(unmined_block)
             currently_mining = False
             unmined_block = None
-        #if blockchain_height() == 9:
-        #    end_time = time.time()
-        #    print("Time elapsed: %.6f s" % (end_time - start_time))
-        #    return
+        if blockchain_height() == 9:
+            end_time = time.time()
+            print("Time elapsed: %.6f s" % (end_time - start_time))
+            pr.disable()
+            pr.dump_stats("main_loop.txt")
+            return
         #if blocks_received == 6:
         #    end_time = time.time()
         #    print("Time elapsed: %.6f s" % (end_time - start_time))
