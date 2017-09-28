@@ -56,6 +56,7 @@ class Miner(threading.Thread):
         self.result_q = result_q
 
     def run(self):
+        start_time = time.time()
         print_if_verbose("Miner thread started!")
         nonce_seed = 0
         bytes_to_hash = bytearray(128 + 128 * self.block.num_transactions)
@@ -73,6 +74,7 @@ class Miner(threading.Thread):
                 self.result_q.put((nonce, h))
                 self.finish_event.set()
                 # the miner thread is done
+                print("[MINER] Time elapsed:", time.time() - start_time, "s")
                 return
             nonce_seed += 1
         print_if_verbose("[MINER] Interrupted by incoming block!")
@@ -567,7 +569,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
         #    end_time = time.time()
         #    print("Time elapsed: %.6f s" % (end_time - start_time))
         #    return
-        if blocks_received == 6:
-            end_time = time.time()
-            print("Time elapsed: %.6f s" % (end_time - start_time))
-            return
+        #if blocks_received == 6:
+        #    end_time = time.time()
+        #    print("Time elapsed: %.6f s" % (end_time - start_time))
+        #    return
