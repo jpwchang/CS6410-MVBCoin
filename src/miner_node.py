@@ -31,6 +31,8 @@ blockchain = []
 # the set of all transactions we have ever received (either directly or as part
 # of an accepted block from another node)
 tx_history = set()
+# flag to indicate whether the miner thread is active
+currently_mining = False
 # controls verbosity setting for all functions in this file
 verbose = False
 
@@ -75,6 +77,15 @@ class Miner(threading.Thread):
             nonce_seed += 1
         print_if_verbose("[MINER] Interrupted by incoming block!")
         self.interrupt_event.clear()
+
+def hash_matches_blockchain(other_hash):
+    """
+    Check if the given hash matches the hash of the last block in our current
+    blockchain
+    """
+    if blockchain_height() == -1:
+        return True
+    return other_hash == blockchain[-1].block_hash
 
 def parse_ports(msg):
     # extract the list of ports from the reply
@@ -233,48 +244,61 @@ def read_block(ext_conn, block_msg_len):
             bytes_to_read -= bytes_read
     return buf
 
-def drop_unmined_block(remote_block):
+def remove_mempool_duplicates(blocks):
+    """
+    Remove any transactions from the mempool that also show up in blocks, which
+    is a list of blocks to check against. This function gets called when one or
+    more blocks from another node are accepted into our blockchain.
+    """
+    global mempool
+
+    print_if_verbose("Scanning mempool for duplicate transactions...")
+    new_mempool = []
+    for transaction in mempool:
+        # check if this transaction is found in any of the new blocks
+        tx_is_duplicate = False
+        for block in blocks:
+            if block.contains_transaction(transaction):
+                tx_is_duplicate = True
+        if not tx_is_duplicate:
+            new_mempool.append(transaction)
+    # if we have dropped any duplicate transactions, commit those changes to the
+    # mempool
+    if len(new_mempool) != len(mempool):
+        print("Dropped", len(mempool) - len(new_mempool), "duplicate transactions")
+        mempool = new_mempool
+
+def accept_remote_block(remote_block):
     """
     This function is called when a block is received via SEND_BLOCK that is at
     the same height as the block currently being mined. If this happens, we
     must undo the changes made to the UTXO set by the unmined block, validate
     the new block, and accept the new block. Any transactions that were in
     the unmined block and not in the received block will be placed back onto
-    the start of the mempool for inclusion in a future block. Returns whether
-    or not we chose to accept the remote block.
+    the start of the mempool for inclusion in a future block. 
     """
     global mempool
 
     # this should never be called when there is no block being mined
     assert(unmined_block is not None)
-    # validate the new block by checking its prior hash against the unmined
-    # block's. If they do not match, we have a fork with tied lengths, so to
-    # keep things simple we temporarily keep our own fork.
-    if remote_block.prev_hash != unmined_block.prev_hash:
-        return False
     # first, undo the transactions in the unmined block
     print_if_verbose("Undoing uncommitted UTXO changes...")
     for transaction in unmined_block.transactions:
         sender, receiver, amt, timestamp = parse_transaction(transaction)
         utxo[sender] += amt
         utxo[receiver] -= amt
+        # push the undone transaction back into mempool
+        mempool.append(transaction)
     # commit all transactions to the UTXO set
     for transaction in remote_block.transactions:
         sender, receiver, amt, timestamp = parse_transaction(transaction)
         utxo[sender] -= amt
         utxo[receiver] += amt
         tx_history.add(transaction)
+    # add the remote block to the end of the blockchain
     blockchain.append(remote_block)
-    # any transactions that were in the unmined block but not in the new
-    # block must be placed back at the head of the mempool
-    unhandled_tx = []
-    for transaction in unmined_block.transactions:
-        if not remote_block.contains_transaction(transaction):
-            unhandled_tx.append(transaction)
-    if len(unhandled_tx) > 0:
-        print_if_verbose("Placing", len(unhandled_tx), "unhandled transactions back into mempool")
-        mempool = unhandled_tx + mempool
-    return True
+    # remove any duplicate transactions from the mempool
+    remove_mempool_duplicates([remote_block])
 
 def get_block(ext_conn, height, block_msg_len, num_tx_in_block):
     """
@@ -287,69 +311,130 @@ def get_block(ext_conn, height, block_msg_len, num_tx_in_block):
     block_data = read_block(ext_conn, block_msg_len)
     return parse_block(block_data, num_tx_in_block)
 
-def sync_blockchain_helper(writers, height, desired_hash, block_msg_len, num_tx_in_block):
+def get_blocks(ending_height, initial_hash, block_msg_len, num_tx_in_block, writers):
     """
-    Recursive helper function for synchronize_blockchain. Does the actual work
-    of retrieving blocks over a remote connection
+    Retrieve all blocks starting from ending height until a common ancestor is
+    found in our blockchain.
     """
-    # Base case #1: we have hit the end of the blockchain and should abort
-    if height == -1:
-        return
-    # Base case #2: our blockchain already contains the block with the desired
-    # hash in the given position, so we are done
-    if blockchain[height] is not None and blockchain[height].block_hash == desired_hash:
-        return
-    # Recursive case: search the network for a node with the desired hash, insert
-    # the found node, and recurse on its previous hash
-    _, writable_conns, _ = select.select([], writers, [])
-    msg = OPCODE_GETHASH + int_to_bytes(height, 32)
-    for conn in writable_conns:
-        conn.send(msg) # send the GET_HASH message to all connections
-    # await the reply
-    readable_conns, _, _ = select.select(writers, [], [])
-    for conn in readable_conns:
-        other_hash = conn.recv(32)
-        if other_hash == desired_hash:
-            # we found the block! now we need to add it to the blockchain and recurse...
-            block = get_block(conn, height, block_msg_len, num_tx_in_block)
-            # adding the block to the blockchain may overwrite an existing block,
-            # in which case we need to undo its transactions
-            if blockchain[height] is not None:
-                print_if_verbose("Undoing transactions in discarded block at height", height)
-                for transaction in blockchain[height].transactions:
-                    sender, receiver, amt, timestamp = parse_transaction(transaction)
-                    utxo[sender] += amt
-                    utxo[receiver] -= amt
-            # insert the block into the blockchain
-            blockchain[height] = block
-            # commit the transactions in the newly added block to the UTXO set
-            for transaction in block.transactions:
+    desired_hash = initial_hash
+    current_height = ending_height
+    blocks_found = []
+    # we will loop until a common ancestor is found
+    while True:
+        try:
+            # if current_height has hit -1 that specifies that we have gotten all
+            # the way to the start of the blockchain, in which case we must return
+            # immediately as there are no more blocks to look for
+            if current_height == -1:
+                return list(reversed(blocks_found))
+            # if the hash we are looking for is already in our blockchain at the
+            # specified height, we are done and can return.
+            if current_height <= blockchain_height() and desired_hash == blockchain[current_height].block_hash:
+                # we built the list of blocks in reverse order, so return it in
+                # the proper order.
+                return list(reversed(blocks_found))
+            # send a GET_HASH request to all peers
+            _, writable_conns, _ = select.select([], writers, [], 5.0)
+            msg = OPCODE_GETHASH + int_to_bytes(current_height, 32)
+            for conn in writable_conns:
+                conn.send(msg)
+            # await the reply
+            readable_conns, _, _ = select.select(writers, [], [], 5.0)
+            for conn in readable_conns:
+                other_hash = conn.recv(32)
+                if other_hash == desired_hash:
+                    # this peer has the block we are looking for!
+                    block = get_block(conn, current_height, block_msg_len, num_tx_in_block)
+                    blocks_found.append(block)
+                    # now we must search for the previous block pointed to by the
+                    # newly received block's prev_hash
+                    desired_hash = block.prev_hash
+                    current_height -= 1
+        except TimeoutError:
+            return None
+
+def handle_new_block(remote_block, num_tx_in_block, block_msg_len, interrupt_event, writers):
+    """
+    Logic to handle a new block sent from a peer node.
+    Implements Kevin Sekniqi's algorithm posted on Piazza.
+    """
+    global mempool, currently_mining, unmined_block, blockchain
+
+    # If the block we received is one higher than our current blockchain
+    # height (not including the unmined block) and consistent with our
+    # current blockchain, we should accept it. However, if we are currently
+    # mining a block at that height, we need to stop the mining and
+    # undo any changes associated with it.
+    if remote_block.height == blockchain_height() + 1 and hash_matches_blockchain(remote_block.prev_hash):
+        if currently_mining:
+            # signal the miner to stop
+            interrupt_event.set()
+            # drop our unmined block and accept the new one
+            accept_remote_block(remote_block)
+            currently_mining = False
+            unmined_block = None
+        else:
+            # append the new block to our blockchain and add its transactions
+            # to our history
+            blockchain.append(remote_block)
+            for transaction in remote_block.transactions:
                 sender, receiver, amt, timestamp = parse_transaction(transaction)
                 utxo[sender] -= amt
                 utxo[receiver] += amt
                 tx_history.add(transaction)
-            sync_blockchain_helper(writers, height - 1, block.prev_hash, block_msg_len, num_tx_in_block)
-            return
-
-def synchronize_blockchain(writers, ending_block, block_msg_len, num_tx_in_block):
-    """
-    Synchronize the state of our blockchain with the global state.
-    After synchronization, we will have a blockchain ending in the block
-    ending_block.
-    Algorithm based on Piazza comment by Jake Gardner
-    """
-    print_if_verbose("Synchronizing blockchain with global state...")
-    # extend the list representing our blockchain so that it's height matches
-    # that of the global one. Any slots between our current height and that of
-    # ending_block will be temporarily filled with Nones
-    for i in range(blockchain_height() + 1, ending_block.height + 1):
-        blockchain.append(None)
-    # insert ending_block into the last slot in the extended blockchain
-    blockchain[ending_block.height] = ending_block
-    # recursively fill in the gaps left when the blockchain was extended
-    sync_blockchain_helper(writers, ending_block.height - 1, ending_block.prev_hash, 
-                           block_msg_len, num_tx_in_block)
-    print_if_verbose("Synchronization complete! Blockchain now has height", blockchain_height())
+    elif (remote_block.height > blockchain_height() + 1) or \
+         (remote_block.height == blockchain_height() + 1 and not hash_matches_blockchain(remote_block.prev_hash)):
+        print_if_verbose("Synchronizing blockchain with global state...")
+        # first, stop any mining currently in progress
+        if currently_mining:
+            interrupt_event.set()
+            print_if_verbose("Undoing uncommitted UTXO changes...")
+            for transaction in unmined_block.transactions:
+                sender, receiver, amt, timestamp = parse_transaction(transaction)
+                utxo[sender] += amt
+                utxo[receiver] -= amt
+                # push this transaction back into the mempool
+                mempool.append(transaction)
+            currently_mining = False
+            unmined_block = None
+        # find all blocks up until a common ancestor
+        print_if_verbose("Requesting blocks from peers...")
+        new_blocks = get_blocks(remote_block.height - 1, remote_block.prev_hash,
+                                block_msg_len, num_tx_in_block, writers)
+        if new_blocks is None:
+            print_if_verbose("No peers responded within 5 seconds, aborting!")
+        else:
+            new_blocks.append(remote_block)
+            # undo all transactions in blocks following the common ancestor
+            print("Undoing tranasctions in", blockchain_height() - new_blocks[0].height + 1, "blocks")
+            for block in blockchain[new_blocks[0].height:]:
+                for transaction in block.transactions:
+                    sender, receiver, amt, timestamp = parse_transaction(transaction)
+                    utxo[sender] += amt
+                    utxo[receiver] -= amt
+                    # push this transaction pack into the mempool
+                    mempool.append(transaction)
+            # drop all blocks after the common ancestor
+            blockchain = blockchain[:new_blocks[0].height]
+            # then append the newly received blocks
+            blockchain += new_blocks
+            # commit all transactions in the new blocks into the mempool
+            for block in new_blocks:
+                sender, receiver, amt, timestamp = parse_transaction(transaction)
+                utxo[sender] -= amt
+                utxo[receiver] += amt
+                tx_history.add(transaction)
+            # finally, clean up any duplicate transactions in the mempool
+            remove_mempool_duplicates(new_blocks)
+            print_if_verbose("Synchronization complete! Blockchain now has height", blockchain_height())
+    elif remote_block.height < blockchain_height() + 1:
+        # propagate all valid transactions in this block
+        for transaction in remote_block.transactions:
+            writable_conns, _, _ = select.select([], writers, [])
+            sender, receiver, amt, timestamp = parse_transaction(transaction)
+            if utxo[sender] >= amt:
+                for writer in writable_conns:
+                    writer.sendall(b'0' + transaction)
 
 def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=False):
     # set the verbosity flag based on input parameter
@@ -391,14 +476,11 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
     # used by the miner thread to pass back the nonce it found
     nonce_q = Queue()
 
-    global unmined_block, mempool 
+    global unmined_block, mempool, currently_mining
 
     # set the length of a block message based on the number of transactions
     # allowed in a block
     block_msg_len = 160 + 128 * num_tx_in_block
-
-    # flag to indicate whether the miner thread is active
-    currently_mining = False
 
     start_time = None
 
@@ -427,57 +509,9 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                     remote_block_data = read_block(conn, block_msg_len)
                     remote_block = parse_block(remote_block_data, num_tx_in_block)
                     # ignore malformed blocks
-                    if remote_block is None:
-                        continue
-                    # if the miner is still mining a block of the same height as the one
-                    # we just received, we need to kill it and accept the received block
-                    if currently_mining and remote_block.height == blockchain_height() + 1:
-                        interrupt_event.set()
-                        remote_block_accepted = drop_unmined_block(remote_block)
-                        if not remote_block_accepted:
-                            miner_thread = Miner(unmined_block, difficulty, interrupt_event, finish_event, nonce_q)
-                            miner_thread.start()
-                            currently_mining = True
-                        else:
-                            currently_mining = False
-                            unmined_block = None
-                    # Since the policy is to always mine the longest block, we will
-                    # not maintain forks that are shorter than our current blockchain
-                    # height. This allows us to save a lot of work, as we never end
-                    # up syncing with forks that end up dying off anyway. We will
-                    # only fork when the other block is at a height greater than our
-                    # current blockchain, and in that scenario we immediately switch
-                    # to that branch and discard our current one; we can always
-                    # switch back with little cost if it ends up being the wrong branch.
-                    # This algorithm was based on discussion with Matt Burke.
-                    if remote_block.height > blockchain_height():
-                        # first, stop any mining currently in progress
-                        unhandled_tx = []
-                        if currently_mining:
-                            interrupt_event.set()
-                            print_if_verbose("Undoing uncommitted UTXO changes...")
-                            for transaction in unmined_block.transactions:
-                                sender, receiver, amt, timestamp = parse_transaction(transaction)
-                                utxo[sender] += amt
-                                utxo[receiver] -= amt    
-                                unhandled_tx.append(transaction)
-                                # temporarily remove this transaction from history
-                                tx_history.discard(transaction)
-                        # run the recursive synchronization algorithm
-                        synchronize_blockchain(list(writers.values()), remote_block, block_msg_len, num_tx_in_block)
-                        # flush any unhandled transactions back into the mempool
-                        if currently_mining:
-                            true_unhandled_tx = []
-                            # do not place transactions that were already handled
-                            # in the merged chain back into the mempool
-                            for transaction in unhandled_tx:
-                                if transaction not in tx_history:
-                                    true_unhandled_tx.append(transaction)
-                            if len(true_unhandled_tx) > 0:
-                                print_if_verbose("Placing", len(true_unhandled_tx), "unhandled transactions back into mempool")
-                                mempool = true_unhandled_tx + mempool
-                            currently_mining = False
-                            unmined_block = None
+                    if remote_block is not None:
+                        handle_new_block(remote_block, num_tx_in_block, block_msg_len, 
+                                         interrupt_event, list(writers.values()))
                 elif msg_type == OPCODE_GETBLOCK:
                     print_if_verbose("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
