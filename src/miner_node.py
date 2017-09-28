@@ -483,6 +483,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
     block_msg_len = 160 + 128 * num_tx_in_block
 
     start_time = None
+    blocks_received = 0
 
     # listen for messages from other nodes
     while True:
@@ -500,10 +501,12 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                 msg_type = conn.recv(1)
                 # separate handlers for each type of message
                 if msg_type == OPCODE_TRANSACTION:
-                    if start_time is None:
-                        start_time = time.time()
+                    #if start_time is None:
+                    #    start_time = time.time()
                     handle_transaction(conn, conns_to_write)
                 elif msg_type == OPCODE_BLOCK:
+                    if blocks_received == 0:
+                        start_time = time.time()
                     # read a block over the external connection
                     print_if_verbose("Received block on connection", conn)
                     remote_block_data = read_block(conn, block_msg_len)
@@ -512,6 +515,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                     if remote_block is not None:
                         handle_new_block(remote_block, num_tx_in_block, block_msg_len, 
                                          interrupt_event, list(writers.values()))
+                    blocks_received += 1
                 elif msg_type == OPCODE_GETBLOCK:
                     print_if_verbose("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
@@ -559,7 +563,11 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
             blockchain.append(unmined_block)
             currently_mining = False
             unmined_block = None
-        if blockchain_height() == 9:
+        #if blockchain_height() == 9:
+        #    end_time = time.time()
+        #    print("Time elapsed: %.6f s" % (end_time - start_time))
+        #    return
+        if blocks_received == 6:
             end_time = time.time()
             print("Time elapsed: %.6f s" % (end_time - start_time))
             return
