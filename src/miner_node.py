@@ -5,9 +5,14 @@ import select
 import threading
 import random
 import time
+import copy
+import multiprocessing
 from collections import Counter
 from queue import Queue
 from cProfile import Profile
+from collections import Counter
+from queue import Queue
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from utils import *
 from block import Block
@@ -20,6 +25,7 @@ OPCODE_BLOCK = b'1'
 OPCODE_GETBLOCK = b'2'
 OPCODE_GETHASH = b'3'
 OPCODE_PORTS = b'4'
+MAX_NONCE = 2**32 - 1
 
 # The UTXO set stores all known addresses that can spend money
 utxo = Counter()
@@ -37,49 +43,37 @@ currently_mining = False
 # controls verbosity setting for all functions in this file
 verbose = False
 
+# Process pool for parallel mining (to be initialized based on numcores)
+process_pool = None
+# Thread pool for concurrently working with shared data
+thread_pool = None
+# used to signal miner threads when an external block comes in
+interrupt_event = multiprocessing.Event()
+
 # drop-in replacement for print which only prints when the verbose flag is set
 def print_if_verbose(*args):
     if verbose:
         print(*args)
 
-class Miner(threading.Thread):
-    """
-    Thread that performs block mining in the background, allowing the
-    main thread to continue listening for messages
-    """
-    def __init__(self, block, difficulty, interrupt_event, finish_event, result_q, 
-                 group=None, target=None, name=None, args=(), kwargs={}, daemon=None):
-        super().__init__(group=group, target=target, name=name, args=args, kwargs=kwargs, daemon=daemon)
-        self.block = block
-        self.difficulty = difficulty
-        self.interrupt_event = interrupt_event
-        self.finish_event = finish_event
-        self.result_q = result_q
-
-    def run(self):
-        #start_time = time.time()
-        print_if_verbose("Miner thread started!")
-        nonce_seed = 0
-        bytes_to_hash = bytearray(128 + 128 * self.block.num_transactions)
-        # leave the first 32 bits of bytes_to_hash for the nonce
-        bytes_to_hash[32:] = self.block.as_bytearray()
-        while not self.interrupt_event.is_set():
-            # keep looping until we find a nonce that works, OR we get
-            # interrupted by an incoming block
-            nonce = int_to_bytes(nonce_seed, 32)
-            bytes_to_hash[:32] = nonce
-            h = hashlib.sha256(bytes_to_hash).digest()
-            if h[:self.difficulty] == b'0' * self.difficulty:
-                # we found a working nonce!
-                print_if_verbose("[MINER] Nonce found!")
-                self.result_q.put((nonce, h))
-                self.finish_event.set()
-                # the miner thread is done
-                #print("[MINER] Time elapsed:", time.time() - start_time, "s")
-                return
-            nonce_seed += 1
-        print_if_verbose("[MINER] Interrupted by incoming block!")
-        self.interrupt_event.clear()
+def mine(block, difficulty, nonce_seed=0):
+    print_if_verbose("Miner thread started!")
+    bytes_to_hash = bytearray(128 + 128 * block.num_transactions)
+    # leave the first 32 bits of bytes_to_hash for the nonce
+    bytes_to_hash[32:] = block.as_bytearray()
+    while not interrupt_event.is_set():
+        # keep looping until we find a nonce that works, OR we get
+        # interrupted by an incoming block
+        nonce = int_to_bytes(nonce_seed, 32)
+        bytes_to_hash[:32] = nonce
+        h = hashlib.sha256(bytes_to_hash).digest()
+        if h[:difficulty] == b'0' * difficulty:
+            # we found a working nonce!
+            print_if_verbose("[MINER] Nonce found!")
+            # the miner thread is done
+            return nonce, h
+        nonce_seed = (nonce_seed + 1) % MAX_NONCE
+    print_if_verbose("[MINER] Interrupted by incoming block!")
+    return None
 
 def hash_matches_blockchain(other_hash):
     """
@@ -184,13 +178,13 @@ def parse_block(block_bytes, num_tx):
     new_block.set_hash(block_hash)
     return new_block
 
-def update_writers(port_list, writers, own_port):
+def update_writers(port_list, writers, own_ports):
     """
     Given a list of ports, update the collection of write sockets so that there
     is a writer for every port in the list
     """
     for port in port_list:
-        if port not in writers and port != own_port:
+        if port not in writers and port not in own_ports:
             writers[port] = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             writers[port].connect(("localhost", port))
             writers[port].setblocking(0)
@@ -356,7 +350,7 @@ def get_blocks(ending_height, initial_hash, block_msg_len, num_tx_in_block, writ
         except TimeoutError:
             return None
 
-def handle_new_block(remote_block, num_tx_in_block, block_msg_len, interrupt_event, writers):
+def handle_new_block(remote_block, num_tx_in_block, block_msg_len, writers):
     """
     Logic to handle a new block sent from a peer node.
     Implements Kevin Sekniqi's algorithm posted on Piazza.
@@ -439,12 +433,17 @@ def handle_new_block(remote_block, num_tx_in_block, block_msg_len, interrupt_eve
                 for writer in writable_conns:
                     writer.sendall(b'0' + transaction)
 
-def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=False):
-    pr = Profile()
-    pr.enable()
-    # set the verbosity flag based on input parameter
-    global verbose 
+def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbose_setting=False):
+    # initialize shared values that depend on command line inputs
+    global verbose, process_pool
     verbose = verbose_setting
+    # one thread is reserved for the main loop
+    if num_cores > 1:
+        process_pool = ProcessPoolExecutor(num_cores - 1)
+
+    # keep track of futures representing miner threads that are either running
+    # or scheduled to run
+    running_miners = []
 
     # initialize the UTXO set
     for i in range(100):
@@ -455,31 +454,26 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
     # connections to other nodes, indexed by their ports
     writers = {}
 
-    # create a socket on which to listen to other nodes
-    node_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    node_sock.bind(("localhost", port))
-    node_sock.listen(10)
+    # create a socket on each port on which to listen to other nodes
+    node_socks = []
+    for port in ports:
+        node_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        node_sock.bind(("localhost", port))
+        node_sock.listen()
+        node_socks.append(node_sock)
 
-    # send a message to the bootnode informing that we are ready,
-    # and get back the list of known ports
-    boot_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    boot_sock.connect(("localhost", BOOTSTRAP_PORT))
-    # send port number concatenated with this node's address
-    msg = int_to_bytes(port) + NODE_ADDRESS
-    boot_sock.sendall(msg)
+    # send port numbers concatenated with this node's address to bootnode
+    for port in ports:
+        boot_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        boot_sock.connect(("localhost", BOOTSTRAP_PORT))
+        msg = int_to_bytes(port) + NODE_ADDRESS
+        boot_sock.sendall(msg)
 
     # list of connections that could receive new messages. This includes
-    # our own socket (which could receive an incoming connection) and
+    # our own sockets (which could receive an incoming connection) and
     # any currently active external connections
-    read_conns = [node_sock]
+    read_conns = copy.copy(node_socks)
 
-    # synchronization primitives for communicating with miner thread
-    # used to stop the mining when a new block is received
-    interrupt_event = threading.Event()
-    # used by the miner thread to signal when it is done mining
-    finish_event = threading.Event()
-    # used by the miner thread to pass back the nonce it found
-    nonce_q = Queue()
 
     global unmined_block, mempool, currently_mining
 
@@ -494,8 +488,8 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
     while True:
         conns_to_read, conns_to_write, _ = select.select(read_conns, list(writers.values()), [])
         for conn in conns_to_read:
-            if conn == node_sock:
-                # if the server socket is available, this means there is a new
+            if conn in node_socks:
+                # if a server socket is available, this means there is a new
                 # incoming connection. Accept the connection and add it to the
                 # list of connections that can be read
                 incoming_conn, addr = conn.accept()
@@ -506,8 +500,8 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                 msg_type = conn.recv(1)
                 # separate handlers for each type of message
                 if msg_type == OPCODE_TRANSACTION:
-                    #if start_time is None:
-                    #    start_time = time.time()
+                    if start_time is None:
+                        start_time = time.time()
                     handle_transaction(conn, conns_to_write)
                 elif msg_type == OPCODE_BLOCK:
                     #if blocks_received == 0:
@@ -519,8 +513,8 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                     # ignore malformed blocks
                     if remote_block is not None:
                         handle_new_block(remote_block, num_tx_in_block, block_msg_len, 
-                                         interrupt_event, list(writers.values()))
-                    blocks_received += 1
+                                         list(writers.values()))
+                    #    blocks_received += 1
                 elif msg_type == OPCODE_GETBLOCK:
                     print_if_verbose("Received GET_BLOCK request on connection", conn)
                     request_height = int(conn.recv(32))
@@ -540,7 +534,7 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                     print_if_verbose("Received updated ports list")
                     known_ports = update_ports(conn)
                     print_if_verbose("New ports are", known_ports)
-                    writers = update_writers(known_ports, writers, port)
+                    writers = update_writers(known_ports, writers, ports)
             # if the mempool now contains at least 50000 transactions,
             # AND the miner thread is not busy, add them to a block and mine
             if len(mempool) >= num_tx_in_block and not currently_mining:
@@ -550,29 +544,46 @@ def miner_node(num_workers, port, num_tx_in_block, difficulty, verbose_setting=F
                 for i in range(num_tx_in_block):
                     transaction = mempool.pop(0)
                     unmined_block.add_transaction(transaction)
-                # begin the mining process in a separate thread
-                miner_thread = Miner(unmined_block, difficulty, interrupt_event, finish_event, nonce_q)
-                miner_thread.start()
-                currently_mining = True
+                # begin the mining process
+                if process_pool is not None:
+                    interrupt_event.clear()
+                    for i in range(num_cores - 1):
+                        nonce_seed = random.randint(0, MAX_NONCE)
+                        future = process_pool.submit(mine, unmined_block, difficulty, nonce_seed)
+                        running_miners.append(future)
+                    currently_mining = True
         # check the progress of our mining
-        if finish_event.is_set():
-            # mining finished!
-            miner_results = nonce_q.get()
-            print_if_verbose("Found working nonce", miner_results[0], "with hash", miner_results[1])
-            finish_event.clear()
-            unmined_block.set_nonce(miner_results[0])
-            unmined_block.set_hash(miner_results[1])
-            # broadcast the block to all other nodes
-            send_block(conns_to_write, unmined_block, miner_results[0], miner_results[1])
-            # add the mined block to our blockchain
-            blockchain.append(unmined_block)
-            currently_mining = False
-            unmined_block = None
+        if any(f.done() for f in running_miners):
+            all_interrupted = True
+            for future in running_miners:
+                if future.done() and future.result() is not None:
+                    # the result of this future is a valid nonce
+                    all_interrupted = False
+                    # stop all the other miners
+                    interrupt_event.set()
+                    # retrieve the nonce and accompanying hash
+                    miner_results = future.result()
+                    print_if_verbose("Found working nonce", miner_results[0], "with hash", miner_results[1])
+                    unmined_block.set_nonce(miner_results[0])
+                    unmined_block.set_hash(miner_results[1])
+                    # broadcast the block to all other nodes
+                    send_block(conns_to_write, unmined_block, miner_results[0], miner_results[1])
+                    # add the mined block to our blockchain
+                    blockchain.append(unmined_block)
+                    currently_mining = False
+                    # discard the other futures since we don't need them anymore
+                    running_miners = []
+                elif not future.done():
+                    all_interrupted = False
+            # if the miners are all done but none of them returned anything, that
+            # means they were interrupted by an incoming block. In that case,
+            # discard the futures as we don't need to keep track of them anymore
+            if all_interrupted:
+                running_miners = []
+
         if blockchain_height() == 9:
             end_time = time.time()
             print("Time elapsed: %.6f s" % (end_time - start_time))
-            pr.disable()
-            pr.dump_stats("main_loop.txt")
             return
         #if blocks_received == 6:
         #    end_time = time.time()
