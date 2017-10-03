@@ -470,7 +470,6 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
     # any currently active external connections
     read_conns = copy.copy(node_socks)
 
-
     global unmined_block, mempool, currently_mining
 
     # set the length of a block message based on the number of transactions
@@ -529,8 +528,11 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
                 # create a new block for mining
                 print_if_verbose("Mining new block at height", blockchain_height() + 1)
                 unmined_block = Block(latest_hash(), NODE_ADDRESS, blockchain_height() + 1)
-                for i in range(num_tx_in_block):
-                    transaction = mempool.pop(0)
+                # grab the first num_tx_in_block transactions from the mempool,
+                # add them to the block and remove them from the mempool
+                block_tx = mempool[:num_tx_in_block]
+                mempool = mempool[num_tx_in_block:]
+                for transaction in block_tx:
                     unmined_block.add_transaction(transaction)
                 # begin the mining process
                 if process_pool is not None:
