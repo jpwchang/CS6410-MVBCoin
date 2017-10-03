@@ -557,7 +557,8 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
                     unmined_block.set_nonce(miner_results[0])
                     unmined_block.set_hash(miner_results[1])
                     # broadcast the block to all other nodes
-                    send_block(conns_to_write, unmined_block, miner_results[0], miner_results[1])
+                    process_pool.submit(send_block, conns_to_write, unmined_block, 
+                                        miner_results[0], miner_results[1])
                     # add the mined block to our blockchain
                     blockchain.append(unmined_block)
                     currently_mining = False
