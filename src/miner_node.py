@@ -71,6 +71,24 @@ def mine(block, difficulty, nonce_seed=0):
     print_if_verbose("[MINER] Interrupted by incoming block!")
     return None
 
+def take_mining_step(block, difficulty, bytes_to_hash, nonce_value):
+    """
+    Take a single step of mining using the given nonce_value. Used in single
+    threaded mode to interleave mining with the main loop
+    """
+    nonce = int_to_bytes(nonce_value, 32)
+    bytes_to_hash[:32] = nonce
+    h = hashlib.sha256(bytes_to_hash).digest()
+    if h[:difficulty] == b'0' * difficulty:
+        # we found a working nonce!
+        print_if_verbose("[MINER] Nonce found!")
+        # stop any miners still working
+        interrupt_event.set()
+        # the miner thread is done
+        return nonce, h
+    else:
+        return None
+
 def hash_matches_blockchain(other_hash):
     """
     Check if the given hash matches the hash of the last block in our current
@@ -470,6 +488,11 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
     # any currently active external connections
     read_conns = copy.copy(node_socks)
 
+    # the current nonce seed for single-threaded mining
+    sequential_nonce_seed = 0
+    # buffer for bytestring representation of current block for single-threaded mining
+    sequential_hash_input = bytearray(128 + 128 * num_tx_in_block)
+
     global unmined_block, mempool, currently_mining
 
     # set the length of a block message based on the number of transactions
@@ -478,7 +501,7 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
 
     # listen for messages from other nodes
     while True:
-        conns_to_read, conns_to_write, _ = select.select(read_conns, list(writers.values()), [])
+        conns_to_read, conns_to_write, _ = select.select(read_conns, list(writers.values()), [], 0)
         for conn in conns_to_read:
             if conn in node_socks:
                 # if a server socket is available, this means there is a new
@@ -541,8 +564,11 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
                         nonce_seed = random.randint(0, MAX_NONCE)
                         future = process_pool.submit(mine, unmined_block, difficulty, nonce_seed)
                         running_miners.append(future)
-                    currently_mining = True
-        # check the progress of our mining
+                # ...otherwise we must mine on the main thread
+                else:
+                    sequential_hash_input[32:] = unmined_block.as_bytearray()
+                currently_mining = True
+        # check the progress of our mining if concurrent mining is enabled
         if any(f.done() for f in running_miners):
             all_interrupted = True
             for future in running_miners:
@@ -571,3 +597,20 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
             # discard the futures as we don't need to keep track of them anymore
             if all_interrupted:
                 running_miners = []
+        # if we are currently mining but are running in single-core mode,
+        # we do not have a spare thread to use to run the miner, so we must
+        # interleave mining steps with the main loop
+        if currently_mining and process_pool is None:
+            miner_results = take_mining_step(unmined_block, difficulty, 
+                                             sequential_hash_input,
+                                             sequential_nonce_seed)
+            if miner_results is not None:
+                print_if_verbose("Found working nonce", miner_results[0], "with hash", miner_results[1])
+                unmined_block.set_nonce(miner_results[0])
+                unmined_block.set_hash(miner_results[1])
+                # broadcast the block to all other nodes
+                send_block(conns_to_write, unmined_block, miner_results[0], miner_results[1])
+                # add the mined block to our blockchain
+                blockchain.append(unmined_block)
+                currently_mining = False
+            sequential_nonce_seed = (sequential_nonce_seed + 1) % MAX_NONCE
