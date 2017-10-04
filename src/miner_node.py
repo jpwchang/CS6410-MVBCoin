@@ -6,11 +6,9 @@ import threading
 import random
 import copy
 import multiprocessing
-import multiprocessing.pool
-import signal
-import sys
 from collections import Counter
 from queue import Queue
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 
 from utils import *
 from block import Block
@@ -48,29 +46,12 @@ thread_pool = None
 # used to signal miner threads when an external block comes in
 interrupt_event = multiprocessing.Event()
 
+# drop-in replacement for print which only prints when the verbose flag is set
 def print_if_verbose(*args):
-    """
-    drop-in replacement for print which only prints when the verbose flag is set
-    """
     if verbose:
         print(*args)
 
-def sigint_handler(signal, frame):
-    """
-    Handler for Ctrl-C events
-    """
-    print("node shutting down...")
-    if process_pool is not None:
-        process_pool.close()
-    sys.exit(0)
-
-def init_worker():
-    """
-    Ensure that worker processes leave Ctrl-C handling to the main thread
-    """
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
-
-def mine(block, difficulty, writers, nonce_seed=0):
+def mine(block, difficulty, nonce_seed=0):
     print_if_verbose("Miner thread started!")
     bytes_to_hash = bytearray(128 + 128 * block.num_transactions)
     # leave the first 32 bits of bytes_to_hash for the nonce
@@ -84,31 +65,11 @@ def mine(block, difficulty, writers, nonce_seed=0):
         if h[:difficulty] == b'0' * difficulty:
             # we found a working nonce!
             print_if_verbose("[MINER] Nonce found!")
-            # stop any miners still working
-            interrupt_event.set()
             # the miner thread is done
-            return nonce, h, writers
+            return nonce, h
         nonce_seed = (nonce_seed + 1) % MAX_NONCE
     print_if_verbose("[MINER] Interrupted by incoming block!")
     return None
-
-def take_mining_step(block, difficulty, bytes_to_hash, nonce_value):
-    """
-    Take a single step of mining using the given nonce_value. Used in single
-    threaded mode to interleave mining with the main loop
-    """
-    nonce = int_to_bytes(nonce_value, 32)
-    bytes_to_hash[:32] = nonce
-    h = hashlib.sha256(bytes_to_hash).digest()
-    if h[:difficulty] == b'0' * difficulty:
-        # we found a working nonce!
-        print_if_verbose("[MINER] Nonce found!")
-        # stop any miners still working
-        interrupt_event.set()
-        # the miner thread is done
-        return nonce, h
-    else:
-        return None
 
 def hash_matches_blockchain(other_hash):
     """
@@ -468,39 +429,17 @@ def handle_new_block(remote_block, num_tx_in_block, block_msg_len, writers):
                 for writer in writable_conns:
                     writer.sendall(b'0' + transaction)
 
-def on_miner_complete(miner_results):
-    """
-    Callback function which gets invoked when a miner thread finishes, either
-    due to finding a working nonce or getting prematurely interrupted
-    """
-    global currently_mining
-
-    # check if we actually got a result (result will be None if this callback
-    # was triggered by an interruption)
-    if miner_results is not None:
-        print_if_verbose("Found working nonce", miner_results[0], "with hash", miner_results[1])
-        unmined_block.set_nonce(miner_results[0])
-        unmined_block.set_hash(miner_results[1])
-        # broadcast the block to all other nodes
-        if process_pool is not None:
-            process_pool.apply_async(send_block, args=(miner_results[2], unmined_block, 
-                                     miner_results[0], miner_results[1]))
-        else:
-            send_block(miner_results[2], unmined_block, miner_results[0],
-                       miner_results[1])
-        # add the mined block to our blockchain
-        blockchain.append(unmined_block)
-        currently_mining = False
-
 def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbose_setting=False):
     # initialize shared values that depend on command line inputs
     global verbose, process_pool
     verbose = verbose_setting
     # one thread is reserved for the main loop
     if num_cores > 1:
-        process_pool = multiprocessing.pool.Pool(num_cores - 1, initializer=init_worker)
-    # register Ctrl-C event handler
-    signal.signal(signal.SIGINT, sigint_handler)
+        process_pool = ProcessPoolExecutor(num_cores - 1)
+
+    # keep track of futures representing miner threads that are either running
+    # or scheduled to run
+    running_miners = []
 
     # initialize the UTXO set
     for i in range(100):
@@ -531,11 +470,6 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
     # any currently active external connections
     read_conns = copy.copy(node_socks)
 
-    # the current nonce seed for single-threaded mining
-    sequential_nonce_seed = 0
-    # buffer for bytestring representation of current block for single-threaded mining
-    sequential_hash_input = bytearray(128 + 128 * num_tx_in_block)
-
     global unmined_block, mempool, currently_mining
 
     # set the length of a block message based on the number of transactions
@@ -544,7 +478,7 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
 
     # listen for messages from other nodes
     while True:
-        conns_to_read, conns_to_write, _ = select.select(read_conns, list(writers.values()), [], 0)
+        conns_to_read, conns_to_write, _ = select.select(read_conns, list(writers.values()), [])
         for conn in conns_to_read:
             if conn in node_socks:
                 # if a server socket is available, this means there is a new
@@ -601,25 +535,39 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
                 for transaction in block_tx:
                     unmined_block.add_transaction(transaction)
                 # begin the mining process
-                # use the process pool if we have spare cores allocated...
                 if process_pool is not None:
                     interrupt_event.clear()
                     for i in range(num_cores - 1):
                         nonce_seed = random.randint(0, MAX_NONCE)
-                        process_pool.apply_async(mine, args=(unmined_block, difficulty, 
-                                                 conns_to_write, nonce_seed),
-                                                 callback=on_miner_complete)
-                # ...otherwise we must mine on the main thread
-                else:
-                    sequential_hash_input[32:] = unmined_block.as_bytearray()
-                currently_mining = True
-            # if we are currently mining but are running in single-core mode,
-            # we do not have a spare thread to use to run the miner, so we must
-            # interleave mining steps with the main loop
-            if currently_mining and process_pool is None:
-                miner_results = take_mining_step(unmined_block, difficulty, 
-                                                 sequential_hash_input,
-                                                 sequential_nonce_seed)
-                if miner_results is not None:
-                    on_miner_complete((miner_results[0], miner_results[1], conns_to_write))
-                sequential_nonce_seed = (sequential_nonce_seed + 1) % MAX_NONCE
+                        future = process_pool.submit(mine, unmined_block, difficulty, nonce_seed)
+                        running_miners.append(future)
+                    currently_mining = True
+        # check the progress of our mining
+        if any(f.done() for f in running_miners):
+            all_interrupted = True
+            for future in running_miners:
+                if future.done() and future.result() is not None:
+                    # the result of this future is a valid nonce
+                    all_interrupted = False
+                    # stop all the other miners
+                    interrupt_event.set()
+                    # retrieve the nonce and accompanying hash
+                    miner_results = future.result()
+                    print_if_verbose("Found working nonce", miner_results[0], "with hash", miner_results[1])
+                    unmined_block.set_nonce(miner_results[0])
+                    unmined_block.set_hash(miner_results[1])
+                    # broadcast the block to all other nodes
+                    process_pool.submit(send_block, conns_to_write, unmined_block, 
+                                        miner_results[0], miner_results[1])
+                    # add the mined block to our blockchain
+                    blockchain.append(unmined_block)
+                    currently_mining = False
+                    # discard the other futures since we don't need them anymore
+                    running_miners = []
+                elif not future.done():
+                    all_interrupted = False
+            # if the miners are all done but none of them returned anything, that
+            # means they were interrupted by an incoming block. In that case,
+            # discard the futures as we don't need to keep track of them anymore
+            if all_interrupted:
+                running_miners = []
