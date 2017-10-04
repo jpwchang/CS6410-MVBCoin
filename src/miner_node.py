@@ -92,6 +92,24 @@ def mine(block, difficulty, writers, nonce_seed=0):
     print_if_verbose("[MINER] Interrupted by incoming block!")
     return None
 
+def take_mining_step(block, difficulty, bytes_to_hash, nonce_value):
+    """
+    Take a single step of mining using the given nonce_value. Used in single
+    threaded mode to interleave mining with the main loop
+    """
+    nonce = int_to_bytes(nonce_value, 32)
+    bytes_to_hash[:32] = nonce
+    h = hashlib.sha256(bytes_to_hash).digest()
+    if h[:difficulty] == b'0' * difficulty:
+        # we found a working nonce!
+        print_if_verbose("[MINER] Nonce found!")
+        # stop any miners still working
+        interrupt_event.set()
+        # the miner thread is done
+        return nonce, h
+    else:
+        return None
+
 def hash_matches_blockchain(other_hash):
     """
     Check if the given hash matches the hash of the last block in our current
@@ -464,8 +482,12 @@ def on_miner_complete(miner_results):
         unmined_block.set_nonce(miner_results[0])
         unmined_block.set_hash(miner_results[1])
         # broadcast the block to all other nodes
-        process_pool.apply_async(send_block, args=(miner_results[2], unmined_block, 
-                                 miner_results[0], miner_results[1]))
+        if process_pool is not None:
+            process_pool.apply_async(send_block, args=(miner_results[2], unmined_block, 
+                                     miner_results[0], miner_results[1]))
+        else:
+            send_block(miner_results[2], unmined_block, miner_results[0],
+                       miner_results[1])
         # add the mined block to our blockchain
         blockchain.append(unmined_block)
         currently_mining = False
@@ -509,8 +531,10 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
     # any currently active external connections
     read_conns = copy.copy(node_socks)
 
-    # buffer to store mining results if running in single-threaded mode
-    sequential_miner_result = None
+    # the current nonce seed for single-threaded mining
+    sequential_nonce_seed = 0
+    # buffer for bytestring representation of current block for single-threaded mining
+    sequential_hash_input = bytearray(128 + 128 * num_tx_in_block)
 
     global unmined_block, mempool, currently_mining
 
@@ -585,6 +609,17 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
                         process_pool.apply_async(mine, args=(unmined_block, difficulty, 
                                                  conns_to_write, nonce_seed),
                                                  callback=on_miner_complete)
-                    currently_mining = True
-                # ...otherwise we will have to mine in the main thread
-                sequential_miner_result = mine(unmined_block, difficulty, conns_to_write)
+                # ...otherwise we must mine on the main thread
+                else:
+                    sequential_hash_input[32:] = unmined_block.as_bytearray()
+                currently_mining = True
+            # if we are currently mining but are running in single-core mode,
+            # we do not have a spare thread to use to run the miner, so we must
+            # interleave mining steps with the main loop
+            if currently_mining and process_pool is None:
+                miner_results = take_mining_step(unmined_block, difficulty, 
+                                                 sequential_hash_input,
+                                                 sequential_nonce_seed)
+                if miner_results is not None:
+                    on_miner_complete((miner_results[0], miner_results[1], conns_to_write))
+                sequential_nonce_seed = (sequential_nonce_seed + 1) % MAX_NONCE
