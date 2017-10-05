@@ -34,17 +34,35 @@ blockchain = []
 # the set of all transactions we have ever received (either directly or as part
 # of an accepted block from another node)
 tx_history = set()
+# list of known ports we can write to (initially empty)
+known_ports = []
+# writable connections to other nodes, indexed by their ports
+writers = {}
+# readable connections to other nodes, indexed by their ports
+readers = {}
+# all sockets used for listening, indexed by their ports
+node_socks = {}
 # flag to indicate whether the miner thread is active
 currently_mining = False
 # controls verbosity setting for all functions in this file
 verbose = False
 
+# locks to protect all data structures that may be shared by threads
+utxo_lock = threading.Lock()
+mempool_lock = threading.Lock()
+blockchain_lock = threading.Lock()
+tx_history_lock = threading.Lock()
+known_ports_lock = threading.Lock()
+writers_lock = threading.Lock()
+readers_lock = threading.Lock()
+
 # Process pool for parallel mining (to be initialized based on numcores)
 process_pool = None
-# Thread pool for concurrently working with shared data
-thread_pool = None
 # used to signal miner threads when an external block comes in
 interrupt_event = multiprocessing.Event()
+# used to signal listener threads to stop so their threads can be recycled for
+# mining purposes. Listening will still happen on the main thread.
+listener_interrupt_event = threading.Event()
 
 # drop-in replacement for print which only prints when the verbose flag is set
 def print_if_verbose(*args):
@@ -141,33 +159,34 @@ def handle_transaction(ext_conn, writers):
     """
     Handle a new transaction being sent over the external connection ext_conn.
     """
-    transaction = ext_conn.recv(128)
-    print_if_verbose("Received transaction")
-    # don't repeat process out this transaction if we have already seen it
-    if transaction in tx_history or transaction in mempool:
-        print_if_verbose("Transaction is duplicate, skipping...")
-        return
-    sender, receiver, amt, timestamp = parse_transaction(transaction)
-    print_if_verbose("From:", binascii.hexlify(sender))
-    print_if_verbose("To:", binascii.hexlify(receiver))
-    print_if_verbose("Amount:", amt)
-    print_if_verbose("Timestamp:", timestamp)
-    # check if the transaction is valid (sender must have enough coins
-    # according to the UTXO set)
-    if amt <= utxo[sender]:
-        print_if_verbose("Sender has enough MVBCoin, transaction is valid")
-        # propagate the transaction
-        for writer in writers:
-            writer.sendall(b'0' + transaction)
-        # queue up the transaction in the mempool
-        mempool.append(transaction)
-        # record that this transaction has been seen before
-        tx_history.add(transaction)
-        # update the balances of the sender and receiver
-        utxo[sender] -= amt
-        utxo[receiver] += amt
-    else:
-        print_if_verbose("Transaction invalid; sender has %d MVBCoin but tried to send %d. Skipping..." % (utxo[sender], amt))
+    with mempool_lock, tx_history_lock, utxo_lock:
+        transaction = ext_conn.recv(128)
+        print_if_verbose("Received transaction")
+        # don't repeat process out this transaction if we have already seen it
+        if transaction in tx_history or transaction in mempool:
+            print_if_verbose("Transaction is duplicate, skipping...")
+            return
+        sender, receiver, amt, timestamp = parse_transaction(transaction)
+        print_if_verbose("From:", binascii.hexlify(sender))
+        print_if_verbose("To:", binascii.hexlify(receiver))
+        print_if_verbose("Amount:", amt)
+        print_if_verbose("Timestamp:", timestamp)
+        # check if the transaction is valid (sender must have enough coins
+        # according to the UTXO set)
+        if amt <= utxo[sender]:
+            print_if_verbose("Sender has enough MVBCoin, transaction is valid")
+            # propagate the transaction
+            for writer in writers:
+                writer.sendall(b'0' + transaction)
+            # queue up the transaction in the mempool
+            mempool.append(transaction)
+            # record that this transaction has been seen before
+            tx_history.add(transaction)
+            # update the balances of the sender and receiver
+            utxo[sender] -= amt
+            utxo[receiver] += amt
+        else:
+            print_if_verbose("Transaction invalid; sender has %d MVBCoin but tried to send %d. Skipping..." % (utxo[sender], amt))
 
 def parse_block(block_bytes, num_tx):
     """
@@ -276,7 +295,7 @@ def remove_mempool_duplicates(blocks):
     # if we have dropped any duplicate transactions, commit those changes to the
     # mempool
     if len(new_mempool) != len(mempool):
-        print("Dropped", len(mempool) - len(new_mempool), "duplicate transactions")
+        print_if_verbose("Dropped", len(mempool) - len(new_mempool), "duplicate transactions")
         mempool = new_mempool
 
 def accept_remote_block(remote_block):
@@ -350,10 +369,11 @@ def get_blocks(ending_height, initial_hash, block_msg_len, num_tx_in_block, writ
             for conn in writable_conns:
                 conn.send(msg)
             # await the reply
-            readable_conns, _, _ = select.select(writers, [], [], 5.0)
-            for conn in readable_conns:
+            block_found = False
+            for conn in writable_conns:
+                readable_conns, _, _ = select.select([conn], [], [])
                 other_hash = conn.recv(32)
-                if other_hash == desired_hash:
+                if other_hash == desired_hash and not block_found:
                     # this peer has the block we are looking for!
                     block = get_block(conn, current_height, block_msg_len, num_tx_in_block)
                     blocks_found.append(block)
@@ -361,6 +381,7 @@ def get_blocks(ending_height, initial_hash, block_msg_len, num_tx_in_block, writ
                     # newly received block's prev_hash
                     desired_hash = block.prev_hash
                     current_height -= 1
+                    block_found = True
         except TimeoutError:
             return None
 
@@ -371,85 +392,168 @@ def handle_new_block(remote_block, num_tx_in_block, block_msg_len, writers):
     """
     global mempool, currently_mining, unmined_block, blockchain
 
-    # If the block we received is one higher than our current blockchain
-    # height (not including the unmined block) and consistent with our
-    # current blockchain, we should accept it. However, if we are currently
-    # mining a block at that height, we need to stop the mining and
-    # undo any changes associated with it.
-    if remote_block.height == blockchain_height() + 1 and hash_matches_blockchain(remote_block.prev_hash):
-        if currently_mining:
-            # signal the miner to stop
-            interrupt_event.set()
-            # drop our unmined block and accept the new one
-            accept_remote_block(remote_block)
-            currently_mining = False
-            unmined_block = None
-        else:
-            # append the new block to our blockchain and add its transactions
-            # to our history
-            blockchain.append(remote_block)
-            for transaction in remote_block.transactions:
-                sender, receiver, amt, timestamp = parse_transaction(transaction)
-                utxo[sender] -= amt
-                utxo[receiver] += amt
-                tx_history.add(transaction)
-    elif (remote_block.height > blockchain_height() + 1) or \
-         (remote_block.height == blockchain_height() + 1 and not hash_matches_blockchain(remote_block.prev_hash)):
-        print_if_verbose("Synchronizing blockchain with global state...")
-        # first, stop any mining currently in progress
-        if currently_mining:
-            interrupt_event.set()
-            print_if_verbose("Undoing uncommitted UTXO changes...")
-            for transaction in unmined_block.transactions:
-                sender, receiver, amt, timestamp = parse_transaction(transaction)
-                utxo[sender] += amt
-                utxo[receiver] -= amt
-                # push this transaction back into the mempool
-                mempool.append(transaction)
-            currently_mining = False
-            unmined_block = None
-        # find all blocks up until a common ancestor
-        print_if_verbose("Requesting blocks from peers...")
-        new_blocks = get_blocks(remote_block.height - 1, remote_block.prev_hash,
-                                block_msg_len, num_tx_in_block, writers)
-        if new_blocks is None:
-            print_if_verbose("No peers responded within 5 seconds, aborting!")
-        else:
-            new_blocks.append(remote_block)
-            # undo all transactions in blocks following the common ancestor
-            print("Undoing tranasctions in", blockchain_height() - new_blocks[0].height + 1, "blocks")
-            for block in blockchain[new_blocks[0].height:]:
-                for transaction in block.transactions:
+    with mempool_lock, blockchain_lock, utxo_lock, tx_history_lock:
+        # If the block we received is one higher than our current blockchain
+        # height (not including the unmined block) and consistent with our
+        # current blockchain, we should accept it. However, if we are currently
+        # mining a block at that height, we need to stop the mining and
+        # undo any changes associated with it.
+        if remote_block.height == blockchain_height() + 1 and hash_matches_blockchain(remote_block.prev_hash):
+            if currently_mining:
+                # signal the miner to stop
+                interrupt_event.set()
+                # drop our unmined block and accept the new one
+                accept_remote_block(remote_block)
+                currently_mining = False
+                unmined_block = None
+            else:
+                # append the new block to our blockchain and add its transactions
+                # to our history
+                blockchain.append(remote_block)
+                for transaction in remote_block.transactions:
+                    sender, receiver, amt, timestamp = parse_transaction(transaction)
+                    utxo[sender] -= amt
+                    utxo[receiver] += amt
+                    tx_history.add(transaction)
+        elif (remote_block.height > blockchain_height() + 1) or \
+             (remote_block.height == blockchain_height() + 1 and not hash_matches_blockchain(remote_block.prev_hash)):
+            print_if_verbose("Synchronizing blockchain with global state...")
+            # first, stop any mining currently in progress
+            if currently_mining:
+                interrupt_event.set()
+                print_if_verbose("Undoing uncommitted UTXO changes...")
+                for transaction in unmined_block.transactions:
                     sender, receiver, amt, timestamp = parse_transaction(transaction)
                     utxo[sender] += amt
                     utxo[receiver] -= amt
-                    # push this transaction pack into the mempool
+                    # push this transaction back into the mempool
                     mempool.append(transaction)
-            # drop all blocks after the common ancestor
-            blockchain = blockchain[:new_blocks[0].height]
-            # then append the newly received blocks
-            blockchain += new_blocks
-            # commit all transactions in the new blocks into the mempool
-            for block in new_blocks:
+                currently_mining = False
+                unmined_block = None
+            # find all blocks up until a common ancestor
+            print_if_verbose("Requesting blocks from peers...")
+            new_blocks = get_blocks(remote_block.height - 1, remote_block.prev_hash,
+                                    block_msg_len, num_tx_in_block, writers)
+            if new_blocks is None:
+                print_if_verbose("No peers responded within 5 seconds, aborting!")
+            else:
+                new_blocks.append(remote_block)
+                # undo all transactions in blocks following the common ancestor
+                print_if_verbose("Undoing tranasctions in", blockchain_height() - new_blocks[0].height + 1, "blocks")
+                for block in blockchain[new_blocks[0].height:]:
+                    for transaction in block.transactions:
+                        sender, receiver, amt, timestamp = parse_transaction(transaction)
+                        utxo[sender] += amt
+                        utxo[receiver] -= amt
+                        # push this transaction pack into the mempool
+                        mempool.append(transaction)
+                # drop all blocks after the common ancestor
+                blockchain = blockchain[:new_blocks[0].height]
+                # then append the newly received blocks
+                blockchain += new_blocks
+                # commit all transactions in the new blocks into the mempool
+                for block in new_blocks:
+                    sender, receiver, amt, timestamp = parse_transaction(transaction)
+                    utxo[sender] -= amt
+                    utxo[receiver] += amt
+                    tx_history.add(transaction)
+                # finally, clean up any duplicate transactions in the mempool
+                remove_mempool_duplicates(new_blocks)
+                print_if_verbose("Synchronization complete! Blockchain now has height", blockchain_height())
+        elif remote_block.height < blockchain_height() + 1:
+            # propagate all valid transactions in this block
+            for transaction in remote_block.transactions:
+                writable_conns, _, _ = select.select([], writers, [])
                 sender, receiver, amt, timestamp = parse_transaction(transaction)
-                utxo[sender] -= amt
-                utxo[receiver] += amt
-                tx_history.add(transaction)
-            # finally, clean up any duplicate transactions in the mempool
-            remove_mempool_duplicates(new_blocks)
-            print_if_verbose("Synchronization complete! Blockchain now has height", blockchain_height())
-    elif remote_block.height < blockchain_height() + 1:
-        # propagate all valid transactions in this block
-        for transaction in remote_block.transactions:
-            writable_conns, _, _ = select.select([], writers, [])
-            sender, receiver, amt, timestamp = parse_transaction(transaction)
-            if utxo[sender] >= amt:
-                for writer in writable_conns:
-                    writer.sendall(b'0' + transaction)
+                if utxo[sender] >= amt:
+                    for writer in writable_conns:
+                        writer.sendall(b'0' + transaction)
+
+def do_main_loop(ports, num_tx_in_block, block_msg_len, owned_ports):
+    """
+    The main loop of any listener thread, listening on the given ports
+    """
+    global writers, known_ports
+
+    my_socks = [node_socks[port] for port in ports]
+    my_readers = sum((readers[port] for port in ports), [])
+    timeout = 0 if currently_mining else None
+    conns_to_read, conns_to_write, _ = select.select(my_readers, list(writers.values()), [], timeout)
+    for conn in conns_to_read:
+        if conn in my_socks:
+            # if a server socket is available, this means there is a new
+            # incoming connection. Accept the connection and add it to the
+            # list of connections that can be read
+            incoming_conn, addr = conn.accept()
+            port = incoming_conn.getsockname()[1]
+            with readers_lock:
+                readers[port].append(incoming_conn)
+        else:
+            # this must be a new message from a previously connected node
+            # first, read the opcode so we know how much data to chew
+            msg_type = conn.recv(1)
+            # separate handlers for each type of message
+            if msg_type == OPCODE_TRANSACTION:
+                handle_transaction(conn, conns_to_write)
+            elif msg_type == OPCODE_BLOCK:
+                # read a block over the external connection
+                print_if_verbose("Received block on connection", conn)
+                remote_block_data = read_block(conn, block_msg_len)
+                remote_block = parse_block(remote_block_data, num_tx_in_block)
+                # ignore malformed blocks
+                if remote_block is not None:
+                    handle_new_block(remote_block, num_tx_in_block, block_msg_len, 
+                                        list(writers.values()))
+            elif msg_type == OPCODE_GETBLOCK:
+                print_if_verbose("Received GET_BLOCK request on connection", conn)
+                request_height = int(conn.recv(32))
+                # only reply if our blockchain is long enough
+                if request_height <= blockchain_height():
+                    with readers_lock:
+                        send_block([conn], blockchain[request_height],
+                                blockchain[request_height].nonce,
+                                blockchain[request_height].block_hash,
+                                include_opcode=False)
+            elif msg_type == OPCODE_GETHASH:
+                print_if_verbose("Received GET_HASH request on connection", conn)
+                request_height = int(conn.recv(32))
+                # only reply if our blockchain is long enough
+                if request_height <= blockchain_height():
+                    with readers_lock:
+                        conn.send(blockchain[request_height].block_hash)
+            elif msg_type == OPCODE_PORTS:
+                print_if_verbose("Received updated ports list")
+                with known_ports_lock:
+                    known_ports = update_ports(conn)
+                print_if_verbose("New ports are", known_ports)
+                with writers_lock:
+                    writers = update_writers(known_ports, writers, owned_ports)
+
+def listener(ports, num_tx_in_block, block_msg_len, owned_ports):
+    """
+    An individual listener listening on the given ports, running in its own thread
+    """
+    print_if_verbose("Worker thread (re)starting on ports", ports)
+    while not listener_interrupt_event.is_set():
+        do_main_loop(ports, num_tx_in_block, block_msg_len, owned_ports)
+
+def start_listener_threads(lil_ports, num_tx_in_block, block_msg_len, owned_ports):
+    """
+    Start a set of listener threads. The parameter lil_ports is a list of lists
+    of ports (lil = list of lists) where each sub-list is a set of ports to be
+    passed to a listener.
+    """
+    print_if_verbose("(Re)starting", len(lil_ports), "worker threads")
+    threads = []
+    for port_list in lil_ports:
+        thread = threading.Thread(target=listener, args=(port_list, num_tx_in_block, block_msg_len, owned_ports))
+        thread.start()
+        threads.append(thread)
+    return threads
 
 def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbose_setting=False):
     # initialize shared values that depend on command line inputs
-    global verbose, process_pool
+    global verbose, process_pool, known_ports, writers, readers
     verbose = verbose_setting
     # one thread is reserved for the main loop
     if num_cores > 1:
@@ -459,22 +563,21 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
     # or scheduled to run
     running_miners = []
 
+    # keep track of currently active listener threads
+    running_listeners = []
+
     # initialize the UTXO set
     for i in range(100):
         utxo[hashlib.sha256(bytes(str(i), encoding='ascii')).digest()] = 100000
 
-    # list of known ports we can write to (initially empty)
-    known_ports = []
-    # connections to other nodes, indexed by their ports
-    writers = {}
-
     # create a socket on each port on which to listen to other nodes
-    node_socks = []
     for port in ports:
         node_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        node_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         node_sock.bind(("localhost", port))
         node_sock.listen()
-        node_socks.append(node_sock)
+        node_socks[port] = node_sock
+        readers[port] = [node_sock]
 
     # send port numbers concatenated with this node's address to bootnode
     for port in ports:
@@ -482,11 +585,6 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
         boot_sock.connect(("localhost", BOOTSTRAP_PORT))
         msg = int_to_bytes(port) + NODE_ADDRESS
         boot_sock.sendall(msg)
-
-    # list of connections that could receive new messages. This includes
-    # our own sockets (which could receive an incoming connection) and
-    # any currently active external connections
-    read_conns = copy.copy(node_socks)
 
     # the current nonce seed for single-threaded mining
     sequential_nonce_seed = 0
@@ -499,75 +597,54 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
     # allowed in a block
     block_msg_len = 160 + 128 * num_tx_in_block
 
+    # split the listener ports into chunks to be distributed among workers
+    # if we have fewer cores than ports, each thread will need to take multiple ports
+    # otherwise, we can do one port per thread
+    num_chunks = min(num_cores, len(ports))
+    chunks = [ports[i::num_chunks] for i in range(num_chunks)]
+
+    # start listener threads
+    running_listeners = start_listener_threads(chunks[1:], num_tx_in_block, 
+                                               block_msg_len, ports)
+
     # listen for messages from other nodes
     while True:
-        conns_to_read, conns_to_write, _ = select.select(read_conns, list(writers.values()), [], 0)
-        for conn in conns_to_read:
-            if conn in node_socks:
-                # if a server socket is available, this means there is a new
-                # incoming connection. Accept the connection and add it to the
-                # list of connections that can be read
-                incoming_conn, addr = conn.accept()
-                read_conns.append(incoming_conn)
-            else:
-                # this must be a new message from a previously connected node
-                # first, read the opcode so we know how much data to chew
-                msg_type = conn.recv(1)
-                # separate handlers for each type of message
-                if msg_type == OPCODE_TRANSACTION:
-                    handle_transaction(conn, conns_to_write)
-                elif msg_type == OPCODE_BLOCK:
-                    # read a block over the external connection
-                    print_if_verbose("Received block on connection", conn)
-                    remote_block_data = read_block(conn, block_msg_len)
-                    remote_block = parse_block(remote_block_data, num_tx_in_block)
-                    # ignore malformed blocks
-                    if remote_block is not None:
-                        handle_new_block(remote_block, num_tx_in_block, block_msg_len, 
-                                         list(writers.values()))
-                elif msg_type == OPCODE_GETBLOCK:
-                    print_if_verbose("Received GET_BLOCK request on connection", conn)
-                    request_height = int(conn.recv(32))
-                    # only reply if our blockchain is long enough
-                    if request_height <= blockchain_height():
-                        send_block([conn], blockchain[request_height],
-                                   blockchain[request_height].nonce,
-                                   blockchain[request_height].block_hash,
-                                   include_opcode=False)
-                elif msg_type == OPCODE_GETHASH:
-                    print_if_verbose("Received GET_HASH request on connection", conn)
-                    request_height = int(conn.recv(32))
-                    # only reply if our blockchain is long enough
-                    if request_height <= blockchain_height():
-                        conn.send(blockchain[request_height].block_hash)
-                elif msg_type == OPCODE_PORTS:
-                    print_if_verbose("Received updated ports list")
-                    known_ports = update_ports(conn)
-                    print_if_verbose("New ports are", known_ports)
-                    writers = update_writers(known_ports, writers, ports)
-            # if the mempool now contains at least 50000 transactions,
-            # AND the miner thread is not busy, add them to a block and mine
-            if len(mempool) >= num_tx_in_block and not currently_mining:
-                # create a new block for mining
-                print_if_verbose("Mining new block at height", blockchain_height() + 1)
-                unmined_block = Block(latest_hash(), NODE_ADDRESS, blockchain_height() + 1)
-                # grab the first num_tx_in_block transactions from the mempool,
-                # add them to the block and remove them from the mempool
+        # if miner threads are active then the main thread should handle all ports,
+        # otherwise it takes the first chunk and the others are delegated to workers
+        main_thread_ports = ports if currently_mining else chunks[0]
+        do_main_loop(main_thread_ports, num_tx_in_block, block_msg_len, ports)
+        # if the mempool now contains at least 50000 transactions,
+        # AND the miner thread is not busy, add them to a block and mine
+        if len(mempool) >= num_tx_in_block and not currently_mining:
+            # first, shut down the listener threads to get ready to allocate them
+            # to mining instead
+            listener_interrupt_event.set()
+            # create a new block for mining
+            print_if_verbose("Mining new block at height", blockchain_height() + 1)
+            unmined_block = Block(latest_hash(), NODE_ADDRESS, blockchain_height() + 1)
+            # grab the first num_tx_in_block transactions from the mempool,
+            # add them to the block and remove them from the mempool
+            with mempool_lock:
                 block_tx = mempool[:num_tx_in_block]
                 mempool = mempool[num_tx_in_block:]
-                for transaction in block_tx:
-                    unmined_block.add_transaction(transaction)
-                # begin the mining process
-                if process_pool is not None:
-                    interrupt_event.clear()
-                    for i in range(num_cores - 1):
-                        nonce_seed = random.randint(0, MAX_NONCE)
-                        future = process_pool.submit(mine, unmined_block, difficulty, nonce_seed)
-                        running_miners.append(future)
-                # ...otherwise we must mine on the main thread
-                else:
-                    sequential_hash_input[32:] = unmined_block.as_bytearray()
-                currently_mining = True
+            for transaction in block_tx:
+                unmined_block.add_transaction(transaction)
+            # make sure all the listener threads have stopped
+            for thread in running_listeners:
+                thread.join()
+            running_listeners = []
+            listener_interrupt_event.clear()
+            # begin the mining process
+            if process_pool is not None:
+                interrupt_event.clear()
+                for i in range(num_cores - 1):
+                    nonce_seed = random.randint(0, MAX_NONCE)
+                    future = process_pool.submit(mine, unmined_block, difficulty, nonce_seed)
+                    running_miners.append(future)
+            # ...otherwise we must mine on the main thread
+            else:
+                sequential_hash_input[32:] = unmined_block.as_bytearray()
+            currently_mining = True
         # check the progress of our mining if concurrent mining is enabled
         if any(f.done() for f in running_miners):
             all_interrupted = True
@@ -583,13 +660,20 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
                     unmined_block.set_nonce(miner_results[0])
                     unmined_block.set_hash(miner_results[1])
                     # broadcast the block to all other nodes
-                    process_pool.submit(send_block, conns_to_write, unmined_block, 
-                                        miner_results[0], miner_results[1])
+                    send_block(writers.values(), unmined_block, miner_results[0], miner_results[1])
                     # add the mined block to our blockchain
-                    blockchain.append(unmined_block)
+                    with blockchain_lock:
+                        blockchain.append(unmined_block)
                     currently_mining = False
                     # discard the other futures since we don't need them anymore
                     running_miners = []
+                    # close the process pool to free up the processes, and reinitialize it
+                    process_pool.shutdown()
+                    process_pool = ProcessPoolExecutor(num_cores - 1)
+                    # restart the listener threads now that the cores are freed up
+                    running_listeners = start_listener_threads(chunks[1:], num_tx_in_block, 
+                                                               block_msg_len, ports)
+                    break
                 elif not future.done():
                     all_interrupted = False
             # if the miners are all done but none of them returned anything, that
@@ -597,6 +681,13 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
             # discard the futures as we don't need to keep track of them anymore
             if all_interrupted:
                 running_miners = []
+                currently_mining = False
+                # close the process pool to free up the processes, and reinitialize it
+                process_pool.shutdown()
+                process_pool = ProcessPoolExecutor(num_cores - 1)
+                # restart the listener threads now that the cores are freed up
+                running_listeners = start_listener_threads(chunks[1:], num_tx_in_block, 
+                                                           block_msg_len, ports)
         # if we are currently mining but are running in single-core mode,
         # we do not have a spare thread to use to run the miner, so we must
         # interleave mining steps with the main loop
@@ -609,7 +700,7 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
                 unmined_block.set_nonce(miner_results[0])
                 unmined_block.set_hash(miner_results[1])
                 # broadcast the block to all other nodes
-                send_block(conns_to_write, unmined_block, miner_results[0], miner_results[1])
+                send_block(writers.values(), unmined_block, miner_results[0], miner_results[1])
                 # add the mined block to our blockchain
                 blockchain.append(unmined_block)
                 currently_mining = False
