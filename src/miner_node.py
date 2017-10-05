@@ -717,6 +717,7 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
         if blockchain_height() == 9:
             end_time = time.time()
             print("Time elapsed: %.6f s" % (end_time - start_time))
+            listener_interrupt_event.set()
             return
         #if blocks_received == 6:
         #    end_time = time.time()
