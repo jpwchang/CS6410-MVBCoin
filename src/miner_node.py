@@ -712,7 +712,9 @@ def miner_node(num_workers, ports, num_tx_in_block, difficulty, num_cores, verbo
                 # add the mined block to our blockchain
                 blockchain.append(unmined_block)
                 currently_mining = False
-            sequential_nonce_seed = (sequential_nonce_seed + 1) % MAX_NONCE
+                sequential_nonce_seed = 0
+            else:
+                sequential_nonce_seed = (sequential_nonce_seed + 1) % MAX_NONCE
 
         if blockchain_height() == 9:
             end_time = time.time()
