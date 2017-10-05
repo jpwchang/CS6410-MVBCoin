@@ -18,6 +18,7 @@ def bootstrap_node():
 
     # socket to handle incoming connections
     boot_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    boot_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     boot_sock.bind(("localhost", 8888))
     boot_sock.listen(10)
 
